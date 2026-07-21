@@ -2,16 +2,27 @@
 
 veritas-cache is an OpenAI-compatible cache proxy. It receives requests from an OpenAI SDK client. It returns a stored response on a cache hit. It forwards the request on a cache miss.
 
-Phase 1 implements exact-match caching only. Semantic matching comes later.
+Phase 1 implements exact-match and semantic caching with one static global threshold.
 
 ## Requirements
 
 - Rust 1.96 or newer
 - An API key for an upstream LLM provider, such as OpenAI
+- Downloaded local model files for embeddings
+
+## Download the embedding model
+
+Run the fetch script once before the first build. The script downloads the model files into `models/`.
+
+```bash
+./scripts/fetch_model.sh
+```
+
+Do not commit the files in `models/`.
 
 ## Run the proxy
 
-Set the upstream base URL and API key. Then start the server.
+Set the upstream base URL and API key. Set `SEMANTIC_THRESHOLD` if you want a threshold other than the default `0.85`. Then start the server.
 
 ```bash
 export UPSTREAM_BASE_URL=https://api.openai.com
@@ -36,10 +47,13 @@ client = OpenAI(
 
 ## Cache behavior
 
-- The proxy stores exact request matches in a local SQLite database.
-- `x-cache: HIT` means the response came from the cache.
-- `x-cache: MISS` means the proxy called the upstream API and stored the response.
+- The proxy checks exact request matches first.
+- If the exact match misses, the proxy embeds the prompt and checks approximate nearest neighbors with a cosine similarity threshold.
+- `x-cache: HIT` means the response came from the cache. `x-cache: MISS` means the proxy called the upstream API and stored the response.
+- `x-cache-match: exact` marks an exact hit. `x-cache-match: semantic` marks a semantic hit.
+- `x-cache-sim: 0.876543` shows the cosine similarity of a semantic hit.
+- `SEMANTIC_THRESHOLD` controls the minimum cosine similarity for a semantic hit. The default is `0.85`.
 
 ## Status
 
-Phase 1: exact-match cache only. Streaming is not supported yet.
+Phase 1: exact-match and semantic cache with one static threshold. Streaming is not supported yet.

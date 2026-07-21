@@ -6,6 +6,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use hnsw_rs::prelude::*;
+use ort::{session::Session, value::Tensor};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -13,15 +15,19 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
 use tracing::{error, info};
 
-// The application state contains the database and the HTTP client.
+// The application state contains the database, the HTTP client, the embedder and the ANN index.
 #[derive(Clone)]
 struct AppState {
     db: Arc<Mutex<Connection>>,
     client: reqwest::Client,
     upstream_base: String,
+    semantic_threshold: f32,
+    embedder: Arc<Mutex<Embedder>>,
+    index: Arc<Hnsw<'static, f32, DistCosine>>,
 }
 
 // OpenAI chat completion request structure.
@@ -40,6 +46,13 @@ struct ChatRequest {
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+// Embedding model and tokenizer.
+// Session::run needs mut self, so embedder access uses a Mutex.
+struct Embedder {
+    tokenizer: Tokenizer,
+    session: Session,
 }
 
 // Return a simple health check response.
@@ -83,6 +96,145 @@ fn cache_key(request: &ChatRequest) -> Result<String, serde_json::Error> {
     Ok(to_hex(&Sha256::digest(&json_bytes)))
 }
 
+// Join all messages into one embedding string.
+// Each message becomes one line in the form "role: content".
+fn prompt_text(request: &ChatRequest) -> String {
+    let mut lines = Vec::with_capacity(request.messages.len());
+    for msg in &request.messages {
+        let role = msg
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("user")
+            .to_string();
+        let content = msg
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        lines.push(format!("{}: {}", role, content));
+    }
+    lines.join("\n")
+}
+
+// Create the embedder from model files on disk.
+// Exit with a clear error if the files are missing.
+fn build_embedder() -> Result<Embedder, Box<dyn std::error::Error + Send + Sync>> {
+    let model_path = "models/model.onnx";
+    let tokenizer_path = "models/tokenizer.json";
+
+    if !std::path::Path::new(model_path).exists() || !std::path::Path::new(tokenizer_path).exists()
+    {
+        eprintln!(
+            "Model files are missing. Run ./scripts/fetch_model.sh to download them. \
+             Expected files: {} and {}",
+            model_path, tokenizer_path
+        );
+        std::process::exit(1);
+    }
+
+    let tokenizer = Tokenizer::from_file(tokenizer_path)?;
+    let session = Session::builder()?.commit_from_file(model_path)?;
+
+    Ok(Embedder { tokenizer, session })
+}
+
+// Compute a sentence embedding.
+// Tokenize the prompt, run the ONNX model, mean pool the last hidden state, and L2-normalize.
+fn embed(
+    embedder: &mut Embedder,
+    text: &str,
+) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
+    let encoding = embedder
+        .tokenizer
+        .encode(text, true)
+        .map_err(|e| e.to_string())?;
+    let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
+    let attention_mask: Vec<i64> = encoding
+        .get_attention_mask()
+        .iter()
+        .map(|&x| x as i64)
+        .collect();
+    let token_type_ids: Vec<i64> = encoding.get_type_ids().iter().map(|&x| x as i64).collect();
+    let len = input_ids.len();
+
+    let outputs = embedder.session.run(ort::inputs! {
+        "input_ids" => Tensor::from_array(([1, len], input_ids))?,
+        "attention_mask" => Tensor::from_array(([1, len], attention_mask.clone()))?,
+        "token_type_ids" => Tensor::from_array(([1, len], token_type_ids))?,
+    })?;
+
+    let (shape, raw) = outputs["last_hidden_state"].try_extract_tensor::<f32>()?;
+    let shape = shape.iter().map(|&d| d as usize).collect::<Vec<_>>();
+    if shape.len() != 3 {
+        return Err("Unexpected hidden state shape".into());
+    }
+    let seq_len = shape[1];
+    let hidden_dim = shape[2];
+    if raw.len() != seq_len * hidden_dim {
+        return Err("Hidden state size mismatch".into());
+    }
+
+    // Mean pooling over sequence positions weighted by the attention mask.
+    let mut pooled = vec![0.0f32; hidden_dim];
+    let mut mask_sum = 0.0f32;
+    for i in 0..seq_len {
+        let mask = attention_mask[i] as f32;
+        mask_sum += mask;
+        for j in 0..hidden_dim {
+            pooled[j] += raw[i * hidden_dim + j] * mask;
+        }
+    }
+    if mask_sum > 0.0 {
+        for val in &mut pooled {
+            *val /= mask_sum;
+        }
+    }
+
+    // L2-normalize the pooled vector.
+    let norm: f32 = pooled.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for val in &mut pooled {
+            *val /= norm;
+        }
+    }
+
+    Ok(pooled)
+}
+
+// Convert an embedding vector into a little-endian f32 blob.
+fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(embedding.len() * 4);
+    for &v in embedding {
+        blob.extend_from_slice(&v.to_le_bytes());
+    }
+    blob
+}
+
+// Convert a little-endian f32 blob back into a vector.
+fn embedding_from_blob(blob: &[u8]) -> Option<Vec<f32>> {
+    if blob.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(blob.len() / 4);
+    for chunk in blob.chunks_exact(4) {
+        let bytes: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        out.push(f32::from_le_bytes(bytes));
+    }
+    Some(out)
+}
+
+// Cosine similarity between two L2-normalized vectors.
+// The result is the dot product because both inputs are unit length.
+#[allow(dead_code)]
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+// Decide whether a semantic hit is above the configured threshold.
+fn semantic_hit(similarity: f32, threshold: f32) -> bool {
+    similarity >= threshold
+}
+
 // Create the cache table if it does not exist and switch to WAL mode.
 fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -92,7 +244,9 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
             request_json TEXT NOT NULL,
             response_json TEXT NOT NULL,
             created_at INTEGER NOT NULL,
-            hit_count INTEGER NOT NULL DEFAULT 0
+            hit_count INTEGER NOT NULL DEFAULT 0,
+            model TEXT NOT NULL,
+            embedding BLOB NOT NULL
         )",
         [],
     )?;
@@ -101,9 +255,22 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
 
 // Look up a cached response by key.
 fn lookup(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
-    let mut stmt =
-        conn.prepare("SELECT response_json FROM entries WHERE key_hash = ?1")?;
+    let mut stmt = conn.prepare("SELECT response_json FROM entries WHERE key_hash = ?1")?;
     stmt.query_row([key], |row| row.get::<_, String>(0))
+        .optional()
+}
+
+// Load a response by SQLite rowid.
+fn lookup_by_rowid(conn: &Connection, rowid: i64) -> rusqlite::Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT response_json FROM entries WHERE rowid = ?1")?;
+    stmt.query_row([rowid], |row| row.get::<_, String>(0))
+        .optional()
+}
+
+// Load the model name by SQLite rowid.
+fn model_by_rowid(conn: &Connection, rowid: i64) -> rusqlite::Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT model FROM entries WHERE rowid = ?1")?;
+    stmt.query_row([rowid], |row| row.get::<_, String>(0))
         .optional()
 }
 
@@ -116,33 +283,71 @@ fn increment_hits(conn: &Connection, key: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-// Store a request and its response in the cache.
+// Increase the hit counter for a semantic match.
+fn increment_hits_by_rowid(conn: &Connection, rowid: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE entries SET hit_count = hit_count + 1 WHERE rowid = ?1",
+        [rowid],
+    )?;
+    Ok(())
+}
+
+// Store a request, its response, the model and the embedding in the cache.
+// Return the new SQLite rowid.
 fn store(
     conn: &Connection,
     key: &str,
     request_json: &str,
     response_json: &str,
-) -> rusqlite::Result<()> {
+    model: &str,
+    embedding: &[f32],
+) -> rusqlite::Result<i64> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     conn.execute(
         "INSERT OR REPLACE INTO entries
-         (key_hash, request_json, response_json, created_at, hit_count)
-         VALUES (?1, ?2, ?3, ?4, 0)",
-        params![key, request_json, response_json, now],
+         (key_hash, request_json, response_json, created_at, hit_count, model, embedding)
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+        params![
+            key,
+            request_json,
+            response_json,
+            now,
+            model,
+            embedding_to_blob(embedding)
+        ],
     )?;
-    Ok(())
+    Ok(conn.last_insert_rowid())
 }
 
-// Handle POST /v1/chat/completions: exact-match cache or upstream proxy.
+// Build the in-memory HNSW index from stored embeddings.
+fn build_index(conn: &Connection) -> rusqlite::Result<Hnsw<'static, f32, DistCosine>> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))?;
+    let capacity = (count as usize).max(100);
+    let index = Hnsw::new(16, capacity, 16, 100, DistCosine {});
+    let mut stmt = conn.prepare("SELECT rowid, embedding FROM entries")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let rowid: i64 = row.get(0)?;
+        let blob: Vec<u8> = row.get(1)?;
+        if let Some(embedding) = embedding_from_blob(&blob) {
+            index.insert((&embedding, rowid as usize));
+        } else {
+            error!("Skipping invalid embedding blob for rowid {}", rowid);
+        }
+    }
+    Ok(index)
+}
+
+// Handle POST /v1/chat/completions: exact match, semantic match, or upstream proxy.
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
     body_bytes: Bytes,
 ) -> Response {
-    // Reject streaming requests because Phase 1 does not support them.
+    // Parse the request body.
     let request: ChatRequest = match serde_json::from_slice(&body_bytes) {
         Ok(r) => r,
         Err(e) => {
@@ -156,6 +361,7 @@ async fn chat_completions(
         }
     };
 
+    // Reject streaming requests because Phase 1 does not support them.
     if request.stream == Some(true) {
         return (
             StatusCode::BAD_REQUEST,
@@ -174,7 +380,7 @@ async fn chat_completions(
         }
     };
 
-    // Check the cache first.
+    // Check the exact-match cache first.
     let cached = {
         let conn = state.db.lock().await;
         match lookup(&conn, &key) {
@@ -193,13 +399,94 @@ async fn chat_completions(
         } {
             error!("Failed to update hit count: {}", e);
         }
-        info!("cache hit for key {}", key);
+        info!("cache exact hit for key {}", key);
         return Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
             .header("x-cache", "HIT")
+            .header("x-cache-match", "exact")
             .body(response_json.into())
             .unwrap();
+    }
+
+    // Embed the request prompt.
+    let embedding = {
+        let prompt = prompt_text(&request);
+        let mut embedder = state.embedder.lock().await;
+        match embed(&mut embedder, &prompt) {
+            Ok(e) => e,
+            Err(e) => {
+                error!("Embedding failed: {}", e);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    };
+
+    // Search the HNSW index and post-filter by model.
+    let best_match = {
+        let conn = state.db.lock().await;
+        let mut best: Option<(i64, f32)> = None;
+        for neighbour in state.index.search(&embedding, 5, 32) {
+            let rowid = neighbour.d_id as i64;
+            let distance = neighbour.distance;
+            let similarity = 1.0f32 - distance;
+            let model = match model_by_rowid(&conn, rowid) {
+                Ok(Some(m)) => m,
+                Ok(None) => continue,
+                Err(e) => {
+                    error!("Failed to read model for rowid {}: {}", rowid, e);
+                    continue;
+                }
+            };
+            if model == request.model {
+                match best {
+                    None => best = Some((rowid, similarity)),
+                    Some((_, current)) if similarity > current => best = Some((rowid, similarity)),
+                    _ => {}
+                }
+            }
+        }
+        best
+    };
+
+    // Serve a semantic cache hit if the best match clears the threshold.
+    if let Some((rowid, similarity)) = best_match {
+        if semantic_hit(similarity, state.semantic_threshold) {
+            let response_json = {
+                let conn = state.db.lock().await;
+                match lookup_by_rowid(&conn, rowid) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
+                        error!("Missing response for semantic hit rowid {}", rowid);
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    Err(e) => {
+                        error!("Failed to read semantic hit response: {}", e);
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                }
+            };
+
+            if let Err(e) = {
+                let conn = state.db.lock().await;
+                increment_hits_by_rowid(&conn, rowid)
+            } {
+                error!("Failed to update semantic hit count: {}", e);
+            }
+
+            info!(
+                "cache semantic hit for key {} with similarity {}",
+                key, similarity
+            );
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .header("x-cache", "HIT")
+                .header("x-cache-match", "semantic")
+                .header("x-cache-sim", format!("{:.6}", similarity))
+                .body(response_json.into())
+                .unwrap();
+        }
     }
 
     // Forward the original body to the upstream LLM API.
@@ -233,10 +520,11 @@ async fn chat_completions(
         }
     };
 
-    // Store the response in the cache only when the upstream call succeeded.
-    // Do not cache error responses. A cached error would poison later requests.
+    // Cache successful upstream responses only.
     if status.is_success() {
-        let request_json = match serde_json::to_string(&canonical_json(&serde_json::to_value(&request).unwrap_or(Value::Null))) {
+        let request_json = match serde_json::to_string(&canonical_json(
+            &serde_json::to_value(&request).unwrap_or(Value::Null),
+        )) {
             Ok(j) => j,
             Err(e) => {
                 error!("Failed to serialize request: {}", e);
@@ -244,12 +532,26 @@ async fn chat_completions(
             }
         };
 
-        if let Err(e) = {
+        let rowid = {
             let conn = state.db.lock().await;
-            store(&conn, &key, &request_json, &response_text)
-        } {
-            error!("Failed to store response: {}", e);
-        }
+            match store(
+                &conn,
+                &key,
+                &request_json,
+                &response_text,
+                &request.model,
+                &embedding,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    error!("Failed to store response: {}", e);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        };
+
+        // Insert the new embedding into the in-memory index.
+        state.index.insert((&embedding, rowid as usize));
     }
 
     info!("cache miss for key {}", key);
@@ -263,24 +565,47 @@ async fn chat_completions(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing_subscriber::fmt::init();
+    // Keep dependency logs quiet. Allow an override with RUST_LOG.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "veritas_cache=info,ort=warn,hnsw_rs=warn".into()),
+        )
+        .init();
 
     let db_path = std::env::var("CACHE_DB_PATH").unwrap_or_else(|_| "cache.db".to_string());
     let conn = Connection::open(&db_path)?;
     init_db(&conn)?;
     let db = Arc::new(Mutex::new(conn));
 
-    let upstream_base = std::env::var("UPSTREAM_BASE_URL")
-        .unwrap_or_else(|_| "https://api.openai.com".to_string());
+    let upstream_base =
+        std::env::var("UPSTREAM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".to_string());
+
+    let semantic_threshold = std::env::var("SEMANTIC_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(0.85);
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
 
+    let embedder = Arc::new(Mutex::new(build_embedder()?));
+
+    // Build the index after the database is ready but before serving traffic.
+    let index = {
+        let conn = db.lock().await;
+        build_index(&conn)?
+    };
+    let index = Arc::new(index);
+
     let state = AppState {
         db,
         client,
         upstream_base,
+        semantic_threshold,
+        embedder,
+        index,
     };
 
     let app = Router::new()
@@ -342,16 +667,75 @@ mod tests {
         assert!(lookup(&conn, &key).unwrap().is_none());
 
         let request_json =
-            serde_json::to_string(&canonical_json(&serde_json::to_value(&request).unwrap())).unwrap();
+            serde_json::to_string(&canonical_json(&serde_json::to_value(&request).unwrap()))
+                .unwrap();
         let response_json = r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"4"}}]}"#;
-        store(&conn, &key, &request_json, response_json).unwrap();
+        let embedding = vec![0.1f32; 384];
+        store(
+            &conn,
+            &key,
+            &request_json,
+            response_json,
+            &request.model,
+            &embedding,
+        )
+        .unwrap();
 
         let cached = lookup(&conn, &key).unwrap().unwrap();
         assert!(cached.contains("chatcmpl-test"));
 
         increment_hits(&conn, &key).unwrap();
-        let mut stmt = conn.prepare("SELECT hit_count FROM entries WHERE key_hash = ?1").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT hit_count FROM entries WHERE key_hash = ?1")
+            .unwrap();
         let count: i64 = stmt.query_row([&key], |row| row.get(0)).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn cosine_similarity_of_identical_vectors_is_one() {
+        let v = vec![1.0f32, 0.0, 0.0];
+        assert!((cosine_similarity(&v, &v) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_of_orthogonal_vectors_is_zero() {
+        let a = vec![1.0f32, 0.0, 0.0];
+        let b = vec![0.0f32, 1.0, 0.0];
+        assert!(cosine_similarity(&a, &b).abs() < 1e-6);
+    }
+
+    #[test]
+    fn threshold_decision_is_pure_function() {
+        assert!(semantic_hit(0.9, 0.85));
+        assert!(!semantic_hit(0.84, 0.85));
+    }
+
+    #[test]
+    fn embedding_blob_roundtrip() {
+        let v: Vec<f32> = (0..384).map(|i| i as f32 / 100.0).collect();
+        let blob = embedding_to_blob(&v);
+        assert_eq!(blob.len(), v.len() * 4);
+        let decoded = embedding_from_blob(&blob).unwrap();
+        assert_eq!(v, decoded);
+    }
+
+    #[test]
+    fn embedding_blob_with_bad_length_returns_none() {
+        assert!(embedding_from_blob(&[0, 1, 2]).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires model files in models/"]
+    fn paraphrase_embeddings_are_similar() {
+        let mut embedder = build_embedder().unwrap();
+        let a = embed(&mut embedder, "How big is the universe?").unwrap();
+        let b = embed(&mut embedder, "What is the size of the cosmos?").unwrap();
+        let sim = cosine_similarity(&a, &b);
+        assert!(
+            sim > 0.7,
+            "expected paraphrase similarity > 0.7, got {}",
+            sim
+        );
     }
 }

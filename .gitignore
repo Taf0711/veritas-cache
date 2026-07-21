@@ -13,5 +13,6 @@ docs/
 .pi-subagents/
 
 # Local model and cache files
+models/
 *.onnx
 cache.db*
