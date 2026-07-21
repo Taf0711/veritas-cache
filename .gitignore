@@ -1,0 +1,17 @@
+# Rust build output
+target/
+
+# Local-only project docs (only README.md is pushed)
+AGENTS.md
+CLAUDE.md
+BUILD-PLAN.md
+docs/
+
+# OS and editor files
+.DS_Store
+.env
+.pi-subagents/
+
+# Local model and cache files
+*.onnx
+cache.db*
