@@ -16,3 +16,6 @@ docs/
 models/
 *.onnx
 cache.db*
+
+# Python bytecode
+__pycache__/
