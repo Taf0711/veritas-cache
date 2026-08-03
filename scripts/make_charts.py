@@ -16,6 +16,7 @@ RESULTS_DIR = os.path.join(BASE_DIR, "bench", "results")
 CHARTS_DIR = os.path.join(BASE_DIR, "bench", "charts")
 SEPARATION_PATH = os.path.join(RESULTS_DIR, "separation.csv")
 NN_DIFFICULTY_PATH = os.path.join(RESULTS_DIR, "nn_difficulty.csv")
+STREAM_STATIC_PATH = os.path.join(RESULTS_DIR, "stream_static.csv")
 
 
 def read_separation(path):
@@ -122,8 +123,52 @@ def static_curve_chart(neighbor, path, title):
     print("Wrote {}".format(os.path.relpath(path, BASE_DIR)))
 
 
+def read_stream_static(path):
+    """Read the streaming static CSV. Return the threshold rows."""
+    rows = []
+    with open(path, "r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            rows.append(
+                (
+                    float(row["threshold"]),
+                    float(row["hit_rate"]),
+                    float(row["false_hit_rate"]),
+                )
+            )
+    return rows
+
+
+def stream_curve_chart(rows, path, title):
+    """Draw the streaming static-threshold tradeoff curve.
+
+    Points are connected in threshold order. Each point is labeled
+    with its threshold value.
+    """
+    hit_rates = [row[1] for row in rows]
+    false_rates = [row[2] for row in rows]
+    fig, axis = plt.subplots(figsize=(8, 5))
+    axis.plot(hit_rates, false_rates, marker="o", markersize=5)
+    for threshold, hit_rate, false_rate in rows:
+        axis.annotate(
+            "{:.2f}".format(threshold),
+            (hit_rate, false_rate),
+            textcoords="offset points",
+            xytext=(6, 6),
+            fontsize=8,
+        )
+    axis.set_title(title)
+    axis.set_xlabel("Hit rate")
+    axis.set_ylabel("False-hit rate")
+    axis.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print("Wrote {}".format(os.path.relpath(path, BASE_DIR)))
+
+
 def main():
-    """Run the chart pipeline. Skip charts with missing input."""
+    """Run the chart pipeline. Skip each chart with missing input."""
     os.makedirs(CHARTS_DIR, exist_ok=True)
 
     same, cross = read_separation(SEPARATION_PATH)
@@ -133,24 +178,35 @@ def main():
         "Random pairs: same class vs cross class",
     )
 
-    if not os.path.exists(NN_DIFFICULTY_PATH):
+    if os.path.exists(NN_DIFFICULTY_PATH):
+        best_same, best_cross, neighbor = read_nn_difficulty(NN_DIFFICULTY_PATH)
+        histogram_chart(
+            (best_same, best_cross, ("best same-class", "best cross-class")),
+            os.path.join(CHARTS_DIR, "nn_hist.png"),
+            "Nearest neighbor: best same-class vs best cross-class",
+        )
+        static_curve_chart(
+            neighbor,
+            os.path.join(CHARTS_DIR, "static_curve.png"),
+            "Static threshold tradeoff (leave-one-out, 20000-entry cache)",
+        )
+    else:
         print(
             "Skipped nn_hist.png and static_curve.png. "
             "Missing {}.".format(NN_DIFFICULTY_PATH)
         )
-        return
 
-    best_same, best_cross, neighbor = read_nn_difficulty(NN_DIFFICULTY_PATH)
-    histogram_chart(
-        (best_same, best_cross, ("best same-class", "best cross-class")),
-        os.path.join(CHARTS_DIR, "nn_hist.png"),
-        "Nearest neighbor: best same-class vs best cross-class",
-    )
-    static_curve_chart(
-        neighbor,
-        os.path.join(CHARTS_DIR, "static_curve.png"),
-        "Static threshold tradeoff (leave-one-out, 20000-entry cache)",
-    )
+    if os.path.exists(STREAM_STATIC_PATH):
+        rows = read_stream_static(STREAM_STATIC_PATH)
+        stream_curve_chart(
+            rows,
+            os.path.join(CHARTS_DIR, "stream_curve.png"),
+            "Streaming static threshold tradeoff (20000 prompts)",
+        )
+    else:
+        print(
+            "Skipped stream_curve.png. Missing {}.".format(STREAM_STATIC_PATH)
+        )
 
 
 if __name__ == "__main__":

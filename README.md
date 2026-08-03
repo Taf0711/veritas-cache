@@ -64,19 +64,23 @@ with charts is in `bench/REPORT.md`.
 - A random wrong entry embeds at 0.05 mean cosine similarity. The nearest wrong
   entry embeds at 0.64. The nearest neighbor is the error source.
 - One static threshold cannot hold a high hit rate and a low error rate on this
-  trace. At 0.85 the hit rate is 79.1% with 1.45% wrong answers. At 0.95 the
-  error falls to 0.40% and the hit rate falls to 35.9%.
+  trace. In streaming replay at 0.85 the hit rate is 44.0% with 2.23% wrong
+  answers. At 0.95 the error falls to 0.32% and the hit rate falls to 18.6%.
 - 6.70% of queries have a wrong-class neighbor at 0.85 or higher.
+- The lookup p50 is 18.5 ms on a hit. Miss latency uses a disclosed lognormal
+  model with median 800 ms. The model is not a measurement.
 
 Run the measurements and build the charts.
 
 ```bash
 cargo test --release -- --ignored trace_similarity_separation --nocapture
 cargo test --release -- --ignored trace_nearest_neighbor_difficulty --nocapture
+cargo run --release --bin bench
 python3 scripts/make_charts.py
 ```
 
 ## Status
 
 Phase 1: exact-match and semantic cache with one static threshold. Streaming is not supported yet.
-Phase 2 in progress: benchmark trace and baseline measurements are done. The streaming harness is next.
+Phase 2 in progress: benchmark trace, baseline measurements, and the streaming
+harness are done. The adaptive policy is next.

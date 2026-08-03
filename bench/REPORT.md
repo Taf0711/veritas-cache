@@ -85,6 +85,33 @@ A threshold of 0.85 gives a hit rate of 79.1% and serves 1.45% wrong answers. A
 threshold of 0.95 cuts the error to 0.40% but the hit rate falls to 35.9%. No
 single threshold gives a high hit rate at low error.
 
+### Streaming replay
+
+Figure: charts/stream_curve.png
+
+The streaming harness replays the trace in order against an empty cache. Every
+miss inserts the query as a new entry. Hit latency is measured. Miss latency
+adds a seeded lognormal model with median 800 ms and sigma 0.6. The model is not
+a measurement.
+
+| threshold | hit rate | false-hit rate | false-miss rate | p50 lookup | p99 total |
+|---|---|---|---|---|---|
+| 0.30 | 0.9596 | 0.9028 | 0.0001 | 18.4 ms | 1168 ms |
+| 0.50 | 0.7843 | 0.4979 | 0.0032 | 18.4 ms | 2159 ms |
+| 0.70 | 0.6048 | 0.1250 | 0.0301 | 18.5 ms | 2615 ms |
+| 0.80 | 0.5129 | 0.0433 | 0.0924 | 18.5 ms | 2691 ms |
+| 0.85 | 0.4401 | 0.0223 | 0.1595 | 18.5 ms | 2793 ms |
+| 0.90 | 0.3375 | 0.0089 | 0.2588 | 18.5 ms | 2968 ms |
+| 0.95 | 0.1857 | 0.0032 | 0.4096 | 18.5 ms | 3092 ms |
+| 0.99 | 0.0400 | 0.0003 | 0.5550 | 18.4 ms | 3222 ms |
+
+The streaming regime is harsher than the full-cache snapshot. At 0.85 the
+snapshot gives 79.1% hits at 1.45% error. The stream gives 44.0% hits at 2.23%
+error. The cache starts cold and errors compound.
+
+The lookup p50 is 18.5 ms. Embedding dominates it. A hit costs the lookup only.
+A miss adds the modeled LLM latency.
+
 ## Comparison with vCache
 
 - vCache reports 1.7% error at a static threshold of 0.99 with 150,000 samples.
@@ -104,14 +131,18 @@ single threshold gives a high hit rate at low error.
 2. The trace has the failure mode that matters. The nearest wrong entry is often
    close.
 3. A static global threshold cannot hold a high hit rate and a low error rate on
-   this trace.
+   this trace. The streaming replay confirms this under realistic cold-cache
+   conditions.
 4. Per-entry thresholds have a measurable gap to exploit in Phase 3.
 
 ## Limits
 
 - Quora labels are noisy. Some same-class pairs do not share one correct response.
-- The nearest-neighbor run is a full-cache snapshot. The streaming harness in
-  Phase 2 will give different operating points.
+- The nearest-neighbor run is a full-cache snapshot. The streaming replay gives
+  harsher operating points. Both are reported.
+- Miss latency in the streaming replay is a seeded lognormal model. It is not a
+  measurement. Replace bench/miss_latencies.txt with real recordings to change
+  it.
 - MiniLM is weaker than the paper models. The absolute numbers are not comparable
   to the paper.
 - 2,000 queries give a false-hit resolution of 0.05%.
@@ -125,7 +156,9 @@ python3 scripts/build_trace.py
 python3 scripts/test_trace.py
 cargo test --release -- --ignored trace_similarity_separation --nocapture
 cargo test --release -- --ignored trace_nearest_neighbor_difficulty --nocapture
+cargo run --release --bin bench
 python3 scripts/make_charts.py
 ```
 
-The nearest-neighbor test takes about 23 minutes on an Apple Silicon laptop.
+The nearest-neighbor test takes about 23 minutes on an Apple Silicon laptop. The
+streaming replay takes under 10 minutes and caches the embeddings for reruns.
