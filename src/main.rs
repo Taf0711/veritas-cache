@@ -848,4 +848,147 @@ mod tests {
             same_mean - cross_mean
         );
     }
+
+    #[test]
+    #[ignore = "requires model files and trace; slow"]
+    fn trace_nearest_neighbor_difficulty() {
+        let trace_path = "bench/trace.jsonl";
+        if !std::path::Path::new(trace_path).exists()
+            || !std::path::Path::new("models/model.onnx").exists()
+            || !std::path::Path::new("models/tokenizer.json").exists()
+        {
+            eprintln!("Skipping. Missing {} or model files.", trace_path);
+            return;
+        }
+
+        // Load the trace. Keep the original record order.
+        let mut records: Vec<(String, i64)> = Vec::new();
+        for line in std::fs::read_to_string(trace_path).unwrap().lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let prompt = value["prompt"].as_str().unwrap().to_string();
+            let class_id = value["class_id"].as_i64().unwrap();
+            records.push((prompt, class_id));
+        }
+        let count = records.len();
+
+        // Embed every prompt exactly once.
+        let mut embedder = build_embedder().unwrap();
+        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(count);
+        for (prompt, _) in &records {
+            embeddings.push(embed(&mut embedder, prompt).unwrap());
+        }
+
+        // Sample every 10th record as a query. This is deterministic.
+        let query_indices: Vec<usize> = (0..count).step_by(10).collect();
+        let queries = query_indices.len();
+
+        // Scan every entry for each query. Track the best same-class and the
+        // best different-class neighbor, and the overall best neighbor.
+        let mut best_same: Vec<f32> = Vec::with_capacity(queries);
+        let mut best_cross: Vec<f32> = Vec::with_capacity(queries);
+        let mut best_neighbor_sim: Vec<f32> = Vec::with_capacity(queries);
+        let mut best_neighbor_correct: Vec<bool> = Vec::with_capacity(queries);
+        for &query_index in &query_indices {
+            let query_class = records[query_index].1;
+            let mut same_best = -2.0f32;
+            let mut cross_best = -2.0f32;
+            let mut neighbor_sim = -2.0f32;
+            let mut neighbor_correct = false;
+            for (index, (_, class_id)) in records.iter().enumerate() {
+                if index == query_index {
+                    continue;
+                }
+                let sim = cosine_similarity(&embeddings[query_index], &embeddings[index]);
+                if *class_id == query_class {
+                    if sim > same_best {
+                        same_best = sim;
+                    }
+                } else if sim > cross_best {
+                    cross_best = sim;
+                }
+                if sim > neighbor_sim {
+                    neighbor_sim = sim;
+                    neighbor_correct = *class_id == query_class;
+                }
+            }
+            best_same.push(same_best);
+            best_cross.push(cross_best);
+            best_neighbor_sim.push(neighbor_sim);
+            best_neighbor_correct.push(neighbor_correct);
+        }
+
+        fn percentile(sorted: &[f32], fraction: f64) -> f32 {
+            if sorted.is_empty() {
+                return 0.0;
+            }
+            let position = ((sorted.len() - 1) as f64 * fraction) as usize;
+            sorted[position]
+        }
+
+        fn stats(label: &str, sims: &[f32]) {
+            let mut sorted = sims.to_vec();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mean = sorted.iter().sum::<f32>() / sorted.len() as f32;
+            println!(
+                "{}: mean {:.4} p5 {:.4} p50 {:.4} p95 {:.4} (n {})",
+                label,
+                mean,
+                percentile(&sorted, 0.05),
+                percentile(&sorted, 0.50),
+                percentile(&sorted, 0.95),
+                sorted.len()
+            );
+        }
+
+        stats("best-same", &best_same);
+        stats("best-cross", &best_cross);
+        let mut sorted_same = best_same.clone();
+        sorted_same.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut sorted_cross = best_cross.clone();
+        sorted_cross.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        // Report the share of queries with a confusable different-class neighbor.
+        for threshold in [0.80f32, 0.85, 0.90] {
+            let count = sorted_cross.iter().filter(|&&sim| sim >= threshold).count();
+            println!(
+                "confusable share: {:.2}% of queries have best_cross >= {:.2}",
+                100.0 * count as f32 / queries as f32,
+                threshold
+            );
+        }
+
+        // Compute the static-threshold curve over the full cache.
+        // A query is a hit when its best neighbor clears the threshold.
+        println!("static-threshold curve (n={} queries):", queries);
+        for threshold in [0.30f32, 0.50, 0.70, 0.80, 0.85, 0.90, 0.95, 0.99] {
+            let mut hits = 0;
+            let mut wrong = 0;
+            for index in 0..queries {
+                if best_neighbor_sim[index] >= threshold {
+                    hits += 1;
+                    if !best_neighbor_correct[index] {
+                        wrong += 1;
+                    }
+                }
+            }
+            let hit_rate = hits as f64 / queries as f64;
+            let false_hit_rate = wrong as f64 / queries as f64;
+            println!(
+                "t={:.2} hit={:.4} false={:.4} misses={}",
+                threshold,
+                hit_rate,
+                false_hit_rate,
+                queries - hits
+            );
+        }
+
+        let same_p50 = percentile(&sorted_same, 0.50);
+        let cross_p95 = percentile(&sorted_cross, 0.95);
+        assert!(
+            same_p50 > cross_p95,
+            "expected best-same p50 {} to exceed best-cross p95 {}",
+            same_p50,
+            cross_p95
+        );
+    }
 }
