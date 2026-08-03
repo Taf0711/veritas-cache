@@ -739,6 +739,17 @@ mod tests {
         );
     }
 
+    // Write CSV rows to a file under bench/results. Create the directory.
+    fn write_results_csv(filename: &str, rows: &[String]) {
+        use std::io::Write;
+        let dir = std::path::Path::new("bench/results");
+        std::fs::create_dir_all(dir).unwrap();
+        let mut handle = std::fs::File::create(dir.join(filename)).unwrap();
+        for row in rows {
+            writeln!(handle, "{}", row).unwrap();
+        }
+    }
+
     #[test]
     #[ignore = "requires model files and trace"]
     fn trace_similarity_separation() {
@@ -813,6 +824,17 @@ mod tests {
             .iter()
             .map(|(a, b)| cosine_similarity(&embeddings[a], &embeddings[b]))
             .collect();
+
+        // Write the raw pair similarities for the Python chart script.
+        let mut rows: Vec<String> = Vec::with_capacity(same_sims.len() + cross_sims.len() + 1);
+        rows.push("group,sim".to_string());
+        for sim in &same_sims {
+            rows.push(format!("same,{:.6}", sim));
+        }
+        for sim in &cross_sims {
+            rows.push(format!("cross,{:.6}", sim));
+        }
+        write_results_csv("separation.csv", &rows);
 
         fn percentile(sorted: &[f32], fraction: f64) -> f32 {
             if sorted.is_empty() {
@@ -916,6 +938,22 @@ mod tests {
             best_neighbor_sim.push(neighbor_sim);
             best_neighbor_correct.push(neighbor_correct);
         }
+
+        // Write the raw per-query values for the Python chart script.
+        let mut rows: Vec<String> = Vec::with_capacity(queries + 1);
+        rows.push("query_index,class_id,best_same,best_cross,nn_sim,nn_same_class".to_string());
+        for (i, &query_index) in query_indices.iter().enumerate() {
+            rows.push(format!(
+                "{},{},{:.6},{:.6},{:.6},{}",
+                query_index,
+                records[query_index].1,
+                best_same[i],
+                best_cross[i],
+                best_neighbor_sim[i],
+                best_neighbor_correct[i]
+            ));
+        }
+        write_results_csv("nn_difficulty.csv", &rows);
 
         fn percentile(sorted: &[f32], fraction: f64) -> f32 {
             if sorted.is_empty() {
