@@ -738,4 +738,114 @@ mod tests {
             sim
         );
     }
+
+    #[test]
+    #[ignore = "requires model files and trace"]
+    fn trace_similarity_separation() {
+        use std::collections::{BTreeMap, HashMap, HashSet};
+
+        let trace_path = "bench/trace.jsonl";
+        let model_path = "models/model.onnx";
+        if !std::path::Path::new(trace_path).exists()
+            || !std::path::Path::new(model_path).exists()
+        {
+            eprintln!("Skipping. Missing {} or {}.", trace_path, model_path);
+            return;
+        }
+
+        // Group the trace prompts by class id.
+        let mut classes: BTreeMap<i64, Vec<String>> = BTreeMap::new();
+        for line in std::fs::read_to_string(trace_path).unwrap().lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let prompt = value["prompt"].as_str().unwrap().to_string();
+            let class_id = value["class_id"].as_i64().unwrap();
+            classes.entry(class_id).or_default().push(prompt);
+        }
+
+        // Sample same-class pairs. Take two members from each class in order.
+        let mut same_pairs: Vec<(String, String)> = Vec::new();
+        for members in classes.values() {
+            for window in members.chunks(2) {
+                if window.len() == 2 {
+                    same_pairs.push((window[0].clone(), window[1].clone()));
+                }
+                if same_pairs.len() == 300 {
+                    break;
+                }
+            }
+            if same_pairs.len() == 300 {
+                break;
+            }
+        }
+
+        // Sample cross-class pairs. Use a fixed stride over the class order.
+        let class_ids: Vec<i64> = classes.keys().cloned().collect();
+        let stride = 57;
+        let mut cross_pairs: Vec<(String, String)> = Vec::new();
+        let mut index = 0;
+        while cross_pairs.len() < 300 && index < class_ids.len() {
+            let other = (index + stride) % class_ids.len();
+            cross_pairs.push((
+                classes[&class_ids[index]][0].clone(),
+                classes[&class_ids[other]][0].clone(),
+            ));
+            index += 1;
+        }
+
+        // Embed every unique prompt exactly once.
+        let mut unique: HashSet<&str> = HashSet::new();
+        for (a, b) in same_pairs.iter().chain(cross_pairs.iter()) {
+            unique.insert(a);
+            unique.insert(b);
+        }
+        let mut embedder = build_embedder().unwrap();
+        let mut embeddings: HashMap<String, Vec<f32>> = HashMap::new();
+        for text in unique {
+            embeddings.insert(text.to_string(), embed(&mut embedder, text).unwrap());
+        }
+
+        // Compute the cosine similarity for every pair.
+        let same_sims: Vec<f32> = same_pairs
+            .iter()
+            .map(|(a, b)| cosine_similarity(&embeddings[a], &embeddings[b]))
+            .collect();
+        let cross_sims: Vec<f32> = cross_pairs
+            .iter()
+            .map(|(a, b)| cosine_similarity(&embeddings[a], &embeddings[b]))
+            .collect();
+
+        fn percentile(sorted: &[f32], fraction: f64) -> f32 {
+            if sorted.is_empty() {
+                return 0.0;
+            }
+            let position = ((sorted.len() - 1) as f64 * fraction) as usize;
+            sorted[position]
+        }
+
+        fn stats(label: &str, sims: &[f32]) {
+            let mut sorted = sims.to_vec();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mean = sorted.iter().sum::<f32>() / sorted.len() as f32;
+            println!(
+                "{}: mean {:.4} p5 {:.4} p50 {:.4} p95 {:.4} (n {})",
+                label,
+                mean,
+                percentile(&sorted, 0.05),
+                percentile(&sorted, 0.50),
+                percentile(&sorted, 0.95),
+                sorted.len()
+            );
+        }
+
+        stats("same-class", &same_sims);
+        stats("cross-class", &cross_sims);
+
+        let same_mean = same_sims.iter().sum::<f32>() / same_sims.len() as f32;
+        let cross_mean = cross_sims.iter().sum::<f32>() / cross_sims.len() as f32;
+        assert!(
+            same_mean - cross_mean >= 0.1,
+            "expected same-class mean to exceed cross-class mean by 0.1, got difference {}",
+            same_mean - cross_mean
+        );
+    }
 }
