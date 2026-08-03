@@ -201,7 +201,6 @@ pub fn embedding_from_blob(blob: &[u8]) -> Option<Vec<f32>> {
 
 // Cosine similarity between two L2-normalized vectors.
 // The result is the dot product because both inputs are unit length.
-#[allow(dead_code)]
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }

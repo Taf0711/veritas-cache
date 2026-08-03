@@ -7,7 +7,9 @@ use std::path::Path;
 use std::time::Instant;
 use veritas_cache::policy::StaticPolicy;
 use veritas_cache::replay::replay;
-use veritas_cache::{build_embedder, embed};
+use veritas_cache::{
+    build_embedder, embed, embedding_from_blob, embedding_to_blob,
+};
 
 const EMBEDDING_DIM: usize = 384;
 const EMBEDDING_MAGIC: &[u8] = b"VERITAS_EMBEDDINGS_V1\0";
@@ -75,11 +77,10 @@ fn load_embeddings(
     }
     let mut embeddings = Vec::with_capacity(requested);
     for row in rest[..requested * dimension * 4].chunks_exact(dimension * 4) {
-        let mut embedding = Vec::with_capacity(dimension);
-        for value in row.chunks_exact(4) {
-            embedding.push(f32::from_le_bytes(value.try_into()?));
+        match embedding_from_blob(row) {
+            Some(embedding) => embeddings.push(embedding),
+            None => return Ok(None),
         }
-        embeddings.push(embedding);
     }
     Ok(Some(embeddings))
 }
@@ -96,9 +97,7 @@ fn write_embeddings(
         if embedding.len() != EMBEDDING_DIM {
             return Err("embedding dimension does not match cache format".into());
         }
-        for value in embedding {
-            file.write_all(&value.to_le_bytes())?;
-        }
+        file.write_all(&embedding_to_blob(embedding))?;
     }
     Ok(())
 }
@@ -198,17 +197,6 @@ fn load_miss_latencies(path: &Path) -> Result<Vec<f64>, Box<dyn std::error::Erro
     Ok(values)
 }
 
-fn thresholds() -> Vec<f32> {
-    if let Ok(value) = std::env::var("BENCH_THRESHOLDS") {
-        value
-            .split(',')
-            .filter_map(|item| item.trim().parse().ok())
-            .collect()
-    } else {
-        DEFAULT_THRESHOLDS.to_vec()
-    }
-}
-
 fn percentile(histogram: &hdrhistogram::Histogram<u64>, percentile: f64) -> f64 {
     histogram.value_at_percentile(percentile) as f64
 }
@@ -283,7 +271,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let classes: Vec<i64> = records.iter().map(|record| record.class_id).collect();
     let miss_latencies = load_miss_latencies(Path::new("bench/miss_latencies.txt"))?;
     let mut results = Vec::new();
-    for threshold in thresholds() {
+    for &threshold in DEFAULT_THRESHOLDS {
         let mut policy = StaticPolicy { threshold };
         results.push((
             threshold,
@@ -304,15 +292,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         write_reference_log(Path::new("bench/results/stream_log.csv"), result)?;
     } else {
-        let mut policy = StaticPolicy { threshold: 0.85 };
-        let result = replay(
-            &classes,
-            &embeddings,
-            &embed_us,
-            &mut policy,
-            &miss_latencies,
-        );
-        write_reference_log(Path::new("bench/results/stream_log.csv"), &result)?;
+        println!("Skipped stream_log.csv. Threshold 0.85 is not in the grid.");
     }
 
     println!(
