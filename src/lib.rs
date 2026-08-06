@@ -30,6 +30,27 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+// Extract the response content used by the strict proxy judge.
+pub fn response_content(response_json: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(response_json).ok()?;
+    value
+        .get("choices")?
+        .as_array()?
+        .first()?
+        .get("message")?
+        .get("content")?
+        .as_str()
+        .map(|content| content.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+// Compare two completion contents after whitespace normalization.
+pub fn judge_content_equal(cached_json: &str, fresh_json: &str) -> bool {
+    match (response_content(cached_json), response_content(fresh_json)) {
+        (Some(cached), Some(fresh)) => cached == fresh,
+        _ => false,
+    }
+}
+
 // Embedding model and tokenizer.
 // Session::run needs mut self, so embedder access uses a Mutex.
 pub struct Embedder {
@@ -321,6 +342,27 @@ pub fn build_index(conn: &Connection) -> rusqlite::Result<Hnsw<'static, f32, Dis
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn judge_content_ignores_whitespace_and_ids() {
+        let cached = r#"{"id":"old","choices":[{"message":{"content":"hello   world"}}]}"#;
+        let fresh = r#"{"id":"new","choices":[{"message":{"content":" hello world "}}]}"#;
+        assert!(judge_content_equal(cached, fresh));
+    }
+
+    #[test]
+    fn judge_content_rejects_different_content() {
+        let cached = r#"{"choices":[{"message":{"content":"hello"}}]}"#;
+        let fresh = r#"{"choices":[{"message":{"content":"goodbye"}}]}"#;
+        assert!(!judge_content_equal(cached, fresh));
+    }
+
+    #[test]
+    fn judge_content_rejects_invalid_json() {
+        let valid = r#"{"choices":[{"message":{"content":"hello"}}]}"#;
+        assert!(!judge_content_equal("invalid", valid));
+        assert!(!judge_content_equal(valid, "invalid"));
+    }
 
     #[test]
     fn canonical_json_sorts_object_keys() {

@@ -1,7 +1,8 @@
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -13,15 +14,29 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info};
+use veritas_cache::adaptive::Ld3Policy;
+use veritas_cache::policy::{Decision, Policy};
 use veritas_cache::{
     build_embedder, build_index, cache_key, canonical_json, embed, increment_hits,
-    increment_hits_by_rowid, init_db, lookup, lookup_by_rowid, model_by_rowid, prompt_text,
-    semantic_hit, store, ChatRequest, Embedder, ErrorResponse,
+    increment_hits_by_rowid, init_db, judge_content_equal, lookup, lookup_by_rowid, model_by_rowid,
+    prompt_text, response_content, semantic_hit, store, ChatRequest, Embedder, ErrorResponse,
 };
 
 // Return a simple health check response.
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn add_policy_header(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    if let Ok(value) = state.policy_name.parse() {
+        response.headers_mut().insert("x-cache-policy", value);
+    }
+    response
 }
 
 // The application state contains the database, the HTTP client, the embedder and the ANN index.
@@ -31,6 +46,8 @@ struct AppState {
     client: reqwest::Client,
     upstream_base: String,
     semantic_threshold: f32,
+    policy_name: String,
+    adaptive_policy: Option<Arc<Mutex<Ld3Policy>>>,
     embedder: Arc<Mutex<Embedder>>,
     index: Arc<Hnsw<'static, f32, DistCosine>>,
 }
@@ -99,6 +116,7 @@ async fn chat_completions(
             .header("content-type", "application/json")
             .header("x-cache", "HIT")
             .header("x-cache-match", "exact")
+            .header("x-cache-policy", &state.policy_name)
             .body(response_json.into())
             .unwrap();
     }
@@ -143,9 +161,27 @@ async fn chat_completions(
         best
     };
 
-    // Serve a semantic cache hit if the best match clears the threshold.
+    // Decide whether the semantic neighbor is a hit.
+    let semantic_decision = if state.policy_name == "ld3" {
+        let mut policy = state
+            .adaptive_policy
+            .as_ref()
+            .expect("ld3 policy")
+            .lock()
+            .await;
+        policy.decide(best_match.map(|(rowid, similarity)| (rowid as usize, similarity)))
+    } else {
+        match best_match {
+            Some((_, similarity)) if semantic_hit(similarity, state.semantic_threshold) => {
+                Decision::Hit
+            }
+            _ => Decision::Miss,
+        }
+    };
+
+    // Serve an exact semantic hit. Adaptive hits have a real neighbor.
     if let Some((rowid, similarity)) = best_match {
-        if semantic_hit(similarity, state.semantic_threshold) {
+        if semantic_decision == Decision::Hit {
             let response_json = {
                 let conn = state.db.lock().await;
                 match lookup_by_rowid(&conn, rowid) {
@@ -178,6 +214,7 @@ async fn chat_completions(
                 .header("x-cache", "HIT")
                 .header("x-cache-match", "semantic")
                 .header("x-cache-sim", format!("{:.6}", similarity))
+                .header("x-cache-policy", &state.policy_name)
                 .body(response_json.into())
                 .unwrap();
         }
@@ -226,26 +263,53 @@ async fn chat_completions(
             }
         };
 
-        let rowid = {
-            let conn = state.db.lock().await;
-            match store(
-                &conn,
-                &key,
-                &request_json,
-                &response_text,
-                &request.model,
-                &embedding,
-            ) {
-                Ok(id) => id,
-                Err(e) => {
-                    error!("Failed to store response: {}", e);
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        let mut should_store = true;
+        if state.policy_name == "ld3" {
+            if let Some((rowid, similarity)) = best_match {
+                let cached_json = {
+                    let conn = state.db.lock().await;
+                    lookup_by_rowid(&conn, rowid).ok().flatten()
+                };
+                if let Some(cached_json) = cached_json {
+                    if response_content(&cached_json).is_some()
+                        && response_content(&response_text).is_some()
+                    {
+                        let correct = judge_content_equal(&cached_json, &response_text);
+                        let mut policy = state
+                            .adaptive_policy
+                            .as_ref()
+                            .expect("ld3 policy")
+                            .lock()
+                            .await;
+                        policy.observe(rowid as usize, similarity, correct);
+                        should_store = policy.should_insert();
+                    }
                 }
             }
-        };
+        }
 
-        // Insert the new embedding into the in-memory index.
-        state.index.insert((&embedding, rowid as usize));
+        if should_store {
+            let rowid = {
+                let conn = state.db.lock().await;
+                match store(
+                    &conn,
+                    &key,
+                    &request_json,
+                    &response_text,
+                    &request.model,
+                    &embedding,
+                ) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        error!("Failed to store response: {}", e);
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                }
+            };
+
+            // Insert the new embedding into the in-memory index.
+            state.index.insert((&embedding, rowid as usize));
+        }
     }
 
     info!("cache miss for key {}", key);
@@ -253,6 +317,7 @@ async fn chat_completions(
         .status(status)
         .header("content-type", "application/json")
         .header("x-cache", "MISS")
+        .header("x-cache-policy", &state.policy_name)
         .body(response_text.into())
         .unwrap()
 }
@@ -279,6 +344,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(0.85);
+    let policy_name = std::env::var("SEMANTIC_POLICY").unwrap_or_else(|_| "static".to_string());
+    let adaptive_policy = match policy_name.as_str() {
+        "static" => None,
+        "ld3" => {
+            let delta = std::env::var("ADAPTIVE_DELTA")
+                .ok()
+                .map(|value| value.parse::<f32>())
+                .transpose()
+                .map_err(|e| format!("Invalid ADAPTIVE_DELTA: {e}"))?
+                .unwrap_or(0.05);
+            if !(0.0..=1.0).contains(&delta) {
+                return Err("ADAPTIVE_DELTA must be between 0 and 1".into());
+            }
+            // In-memory state resets on restart. Entries start cold.
+            Some(Arc::new(Mutex::new(Ld3Policy::new(delta))))
+        }
+        other => return Err(format!("Unknown SEMANTIC_POLICY: {other}. Use static or ld3").into()),
+    };
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -298,6 +381,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         client,
         upstream_base,
         semantic_threshold,
+        policy_name,
+        adaptive_policy,
         embedder,
         index,
     };
@@ -305,7 +390,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/health", get(health))
-        .with_state(state);
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(state, add_policy_header));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
     info!("veritas-cache listening on 127.0.0.1:8080");
