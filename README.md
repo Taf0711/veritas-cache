@@ -56,23 +56,31 @@ client = OpenAI(
 
 ## Benchmark
 
-The repository contains a benchmark trace and its measurements. The full report
-with charts is in `bench/REPORT.md`.
+The repository contains a benchmark trace, a replay harness, and four cache
+decision policies. The full scientific report is in `bench/REPORT.md`.
 
-- The trace has 20,000 prompts in 8,101 equivalence classes from Quora Question
-  Pairs. The build is deterministic with seed 42.
+Method summary: 20,000 prompts in 8,101 equivalence classes from Quora Question
+Pairs, replayed 10 times for 200,000 queries. Hit latency is measured. Miss
+latency uses a disclosed lognormal model.
+
+Findings at a glance:
+
 - A random wrong entry embeds at 0.05 mean cosine similarity. The nearest wrong
   entry embeds at 0.64. The nearest neighbor is the error source.
-- One static threshold cannot hold a high hit rate and a low error rate on this
-  trace. In streaming replay at 0.85 the hit rate is 44.0% with 2.23% wrong
-  answers. At 0.95 the error falls to 0.32% and the hit rate falls to 18.6%.
-- 6.70% of queries have a wrong-class neighbor at 0.85 or higher.
-- The lookup p50 is 18.5 ms on a hit. Miss latency uses a disclosed lognormal
-  model with median 800 ms. The model is not a measurement.
+- The per-entry adaptive policy holds its error budget at every operating
+  point. The measured false-hit rate stays 10 to 20 times below the budget.
+- At matched error, the per-entry policy beats the global adaptive policy by
+  about 20 points of hit rate. This reproduces the central claim of the vCache
+  paper (arXiv 2502.03771).
+- A tuned static threshold reaches a higher raw hit rate on this trace. It
+  gives no error guarantee and needs labeled data to tune.
+- The lookup p50 is about 18.6 ms. A hit is about 43 times faster than a
+  modeled miss at the median.
 
 Run the measurements and build the charts.
 
 ```bash
+python3 scripts/build_trace.py
 cargo test --release -- --ignored trace_similarity_separation --nocapture
 cargo test --release -- --ignored trace_nearest_neighbor_difficulty --nocapture
 cargo run --release --bin bench
@@ -81,6 +89,7 @@ python3 scripts/make_charts.py
 
 ## Status
 
-Phase 1: exact-match and semantic cache with one static threshold. Streaming is not supported yet.
-Phase 2 in progress: benchmark trace, baseline measurements, and the streaming
-harness are done. The adaptive policy is next.
+Phase 1: exact-match and semantic cache proxy with one static threshold. Streaming is not supported yet.
+Phase 2: benchmark trace, replay harness, and baseline measurements. Done.
+Phase 3: per-entry adaptive thresholds with a measured error bound. Done. The
+policies are benchmarked in the harness. They are not yet wired into the proxy.

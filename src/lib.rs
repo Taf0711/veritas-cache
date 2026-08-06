@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
 use tracing::error;
 
+pub mod adaptive;
 pub mod policy;
 pub mod replay;
 

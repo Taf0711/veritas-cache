@@ -5,15 +5,16 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::time::Instant;
+use veritas_cache::adaptive::{GdPolicy, Ld3Policy, LdPolicy};
 use veritas_cache::policy::StaticPolicy;
-use veritas_cache::replay::replay;
-use veritas_cache::{
-    build_embedder, embed, embedding_from_blob, embedding_to_blob,
-};
+use veritas_cache::replay::{replay, ReplayResult};
+use veritas_cache::{build_embedder, embed, embedding_from_blob, embedding_to_blob};
 
 const EMBEDDING_DIM: usize = 384;
 const EMBEDDING_MAGIC: &[u8] = b"VERITAS_EMBEDDINGS_V1\0";
 const DEFAULT_THRESHOLDS: &[f32] = &[0.30, 0.50, 0.70, 0.80, 0.85, 0.90, 0.95, 0.99];
+const DELTAS: &[f32] = &[0.01, 0.02, 0.05, 0.10, 0.20];
+const TRACE_LOOPS: usize = 10;
 
 #[derive(Debug, Deserialize)]
 struct TraceRecord {
@@ -203,7 +204,7 @@ fn percentile(histogram: &hdrhistogram::Histogram<u64>, percentile: f64) -> f64 
 
 fn write_static_results(
     path: &Path,
-    rows: &[(f32, veritas_cache::replay::ReplayResult)],
+    rows: &[(f32, ReplayResult)],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut file = File::create(path)?;
     writeln!(file, "threshold,queries,hits,hit_rate,false_hits,false_hit_rate,false_misses,false_miss_rate,p50_lookup_us,p99_lookup_us,p50_total_ms,p99_total_ms")?;
@@ -228,9 +229,42 @@ fn write_static_results(
     Ok(())
 }
 
+fn write_adaptive_row(
+    file: &mut File,
+    policy: &str,
+    delta: f32,
+    result: &ReplayResult,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let queries = result.queries as f64;
+    writeln!(
+        file,
+        "{policy},{delta:.2},{},{},{:.6},{},{:.6},{},{:.6},{:.0},{:.0},{:.3},{:.3}",
+        result.queries,
+        result.hits,
+        result.hits as f64 / queries,
+        result.false_hits,
+        result.false_hits as f64 / queries,
+        result.false_misses,
+        result.false_misses as f64 / queries,
+        percentile(&result.lookup_us, 50.0),
+        percentile(&result.lookup_us, 99.0),
+        percentile(&result.total_us, 50.0) / 1_000.0,
+        percentile(&result.total_us, 99.0) / 1_000.0,
+    )?;
+    println!(
+        "adaptive {policy} delta={delta:.2} | hit rate {:.4} | false-hit rate {:.4} | false-miss rate {:.4} | p50 lookup us {:.0} | p99 total ms {:.3}",
+        result.hits as f64 / queries,
+        result.false_hits as f64 / queries,
+        result.false_misses as f64 / queries,
+        percentile(&result.lookup_us, 50.0),
+        percentile(&result.total_us, 99.0) / 1_000.0,
+    );
+    Ok(())
+}
+
 fn write_reference_log(
     path: &Path,
-    result: &veritas_cache::replay::ReplayResult,
+    result: &ReplayResult,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut file = File::create(path)?;
     writeln!(file, "id,sim,decision,correct,lookup_us")?;
@@ -259,16 +293,27 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map(|value| value.parse())
         .transpose()?;
     let records = read_trace(Path::new("bench/trace.jsonl"), limit)?;
-    let count = records.len();
     fs::create_dir_all("bench/cache")?;
     fs::create_dir_all("bench/results")?;
 
-    let (embeddings, embed_us) = load_or_build_embeddings(
+    let (base_embeddings, base_embed_us) = load_or_build_embeddings(
         &records,
         Path::new("bench/cache/embeddings.bin"),
         Path::new("bench/cache/embed_times.txt"),
     )?;
-    let classes: Vec<i64> = records.iter().map(|record| record.class_id).collect();
+    let base_classes: Vec<i64> = records.iter().map(|record| record.class_id).collect();
+    let mut classes = Vec::with_capacity(base_classes.len() * TRACE_LOOPS);
+    let mut embeddings = Vec::with_capacity(base_embeddings.len() * TRACE_LOOPS);
+    let mut embed_us = Vec::with_capacity(base_embed_us.len() * TRACE_LOOPS);
+    for _ in 0..TRACE_LOOPS {
+        classes.extend_from_slice(&base_classes);
+        embeddings.extend(base_embeddings.iter().cloned());
+        embed_us.extend_from_slice(&base_embed_us);
+    }
+    println!(
+        "Stream looped {TRACE_LOOPS} times. {} queries.",
+        classes.len()
+    );
     let miss_latencies = load_miss_latencies(Path::new("bench/miss_latencies.txt"))?;
     let mut results = Vec::new();
     for &threshold in DEFAULT_THRESHOLDS {
@@ -309,6 +354,47 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             percentile(&result.total_us, 99.0) / 1_000.0,
         );
     }
-    println!("Replayed {count} prompts.");
+    let adaptive_path = Path::new("bench/results/stream_adaptive.csv");
+    let mut adaptive_file = File::create(adaptive_path)?;
+    writeln!(
+        adaptive_file,
+        "policy,delta,queries,hits,hit_rate,false_hits,false_hit_rate,false_misses,false_miss_rate,p50_lookup_us,p99_lookup_us,p50_total_ms,p99_total_ms"
+    )?;
+
+    for &delta in DELTAS {
+        let mut policy = GdPolicy::new(delta);
+        let result = replay(
+            &classes,
+            &embeddings,
+            &embed_us,
+            &mut policy,
+            &miss_latencies,
+        );
+        write_adaptive_row(&mut adaptive_file, "gd", delta, &result)?;
+    }
+    for &delta in DELTAS {
+        let mut policy = LdPolicy::new(delta);
+        let result = replay(
+            &classes,
+            &embeddings,
+            &embed_us,
+            &mut policy,
+            &miss_latencies,
+        );
+        write_adaptive_row(&mut adaptive_file, "ld", delta, &result)?;
+    }
+    for &delta in DELTAS {
+        let mut policy = Ld3Policy::new(delta);
+        let result = replay(
+            &classes,
+            &embeddings,
+            &embed_us,
+            &mut policy,
+            &miss_latencies,
+        );
+        write_adaptive_row(&mut adaptive_file, "ld3", delta, &result)?;
+    }
+
+    println!("Replayed {} queries.", classes.len());
     Ok(())
 }

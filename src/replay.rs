@@ -82,22 +82,25 @@ pub fn replay(
             .expect("lookup latency fits histogram");
 
         let (correct, total_us) = match (decision, neighbor) {
-            (Decision::Hit, Some((entry, similarity))) => {
+            (Decision::Hit, Some((entry, _similarity))) => {
                 let is_correct = entry_classes[entry] == classes[query_index];
                 hits += 1;
                 if !is_correct {
                     false_hits += 1;
                 }
-                policy.observe(entry, similarity, is_correct);
                 (Some(is_correct), lookup_us)
             }
             (Decision::Hit, None) => (Some(false), lookup_us),
-            (Decision::Miss, _) => {
+            (Decision::Miss, neighbor) => {
                 if entry_classes
                     .iter()
                     .any(|&class| class == classes[query_index])
                 {
                     false_misses += 1;
+                }
+                if let Some((entry, similarity)) = neighbor {
+                    let is_correct = entry_classes[entry] == classes[query_index];
+                    policy.observe(entry, similarity, is_correct);
                 }
                 let llm_us = miss_latencies_ms
                     .get(miss_count % miss_latencies_ms.len().max(1))
@@ -141,6 +144,35 @@ pub fn replay(
 mod tests {
     use super::*;
     use crate::policy::StaticPolicy;
+
+    #[derive(Default)]
+    struct ObservationCounter {
+        observations: usize,
+    }
+
+    impl Policy for ObservationCounter {
+        fn decide(&mut self, _neighbor: Option<(usize, f32)>) -> Decision {
+            Decision::Miss
+        }
+
+        fn should_insert(&self) -> bool {
+            true
+        }
+
+        fn observe(&mut self, _entry: usize, _sim: f32, _correct: bool) {
+            self.observations += 1;
+        }
+    }
+
+    #[test]
+    fn replay_observes_only_misses_with_neighbors() {
+        let classes = [0, 0, 1];
+        let embeddings = vec![vec![1.0, 0.0], vec![1.0, 0.0], vec![0.0, 1.0]];
+        let embed_us = [10, 10, 10];
+        let mut policy = ObservationCounter::default();
+        replay(&classes, &embeddings, &embed_us, &mut policy, &[1.0]);
+        assert_eq!(policy.observations, 2);
+    }
 
     #[test]
     fn replay_counts_hits_false_hits_false_misses_and_inserts_misses() {

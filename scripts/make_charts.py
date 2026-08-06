@@ -17,6 +17,7 @@ CHARTS_DIR = os.path.join(BASE_DIR, "bench", "charts")
 SEPARATION_PATH = os.path.join(RESULTS_DIR, "separation.csv")
 NN_DIFFICULTY_PATH = os.path.join(RESULTS_DIR, "nn_difficulty.csv")
 STREAM_STATIC_PATH = os.path.join(RESULTS_DIR, "stream_static.csv")
+STREAM_ADAPTIVE_PATH = os.path.join(RESULTS_DIR, "stream_adaptive.csv")
 
 
 def read_separation(path):
@@ -167,6 +168,67 @@ def stream_curve_chart(rows, path, title):
     print("Wrote {}".format(os.path.relpath(path, BASE_DIR)))
 
 
+def read_stream_adaptive(path):
+    """Read the adaptive CSV. Return (policy, delta, hit, false) rows."""
+    rows = []
+    with open(path, "r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            rows.append(
+                (
+                    row["policy"],
+                    float(row["delta"]),
+                    float(row["hit_rate"]),
+                    float(row["false_hit_rate"]),
+                )
+            )
+    return rows
+
+
+def adaptive_curve_chart(static_rows, adaptive_rows, path, title):
+    """Draw static and adaptive policies on one tradeoff chart.
+
+    The y-axis uses a log scale because false-hit rates span
+    several orders of magnitude. Each adaptive delta is labeled.
+    """
+    fig, axis = plt.subplots(figsize=(8, 5))
+    static_hit = [row[1] for row in static_rows]
+    static_false = [row[2] for row in static_rows]
+    axis.plot(
+        static_hit,
+        static_false,
+        marker=".",
+        markersize=6,
+        label="static",
+    )
+    for policy in ("gd", "ld", "ld3"):
+        points = sorted(
+            [row for row in adaptive_rows if row[0] == policy],
+            key=lambda row: row[1],
+        )
+        hit = [row[2] for row in points]
+        false = [row[3] for row in points]
+        axis.plot(hit, false, marker="o", markersize=5, label=policy)
+        for _, delta, hit_rate, false_rate in points:
+            axis.annotate(
+                "{:.2f}".format(delta),
+                (hit_rate, false_rate),
+                textcoords="offset points",
+                xytext=(6, 6),
+                fontsize=8,
+            )
+    axis.set_title(title)
+    axis.set_xlabel("Hit rate")
+    axis.set_ylabel("False-hit rate")
+    axis.set_yscale("log")
+    axis.grid(True, alpha=0.3)
+    axis.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print("Wrote {}".format(os.path.relpath(path, BASE_DIR)))
+
+
 def main():
     """Run the chart pipeline. Skip each chart with missing input."""
     os.makedirs(CHARTS_DIR, exist_ok=True)
@@ -206,6 +268,22 @@ def main():
     else:
         print(
             "Skipped stream_curve.png. Missing {}.".format(STREAM_STATIC_PATH)
+        )
+
+    if os.path.exists(STREAM_STATIC_PATH) and os.path.exists(STREAM_ADAPTIVE_PATH):
+        static_rows = read_stream_static(STREAM_STATIC_PATH)
+        adaptive_rows = read_stream_adaptive(STREAM_ADAPTIVE_PATH)
+        adaptive_curve_chart(
+            static_rows,
+            adaptive_rows,
+            os.path.join(CHARTS_DIR, "adaptive_curve.png"),
+            "Static vs adaptive policies (200000 queries)",
+        )
+    else:
+        print(
+            "Skipped adaptive_curve.png. Missing {} or {}.".format(
+                STREAM_STATIC_PATH, STREAM_ADAPTIVE_PATH
+            )
         )
 
 
