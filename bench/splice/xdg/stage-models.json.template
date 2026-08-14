@@ -1,0 +1,32 @@
+{
+  "default": {
+    "provider_profile": "veritas",
+    "model": "__MODEL__"
+  },
+  "stages": {
+    "code_writer": {
+      "provider_profile": "veritas",
+      "model": "__MODEL__"
+    },
+    "test_generator": {
+      "provider_profile": "veritas",
+      "model": "__MODEL__"
+    },
+    "plan_critic": {
+      "provider_profile": "veritas",
+      "model": "__MODEL__"
+    },
+    "step_back": {
+      "provider_profile": "veritas",
+      "model": "__MODEL__"
+    },
+    "design_crystallize": {
+      "provider_profile": "veritas",
+      "model": "__MODEL__"
+    },
+    "design_conversation": {
+      "provider_profile": "veritas",
+      "model": "__MODEL__"
+    }
+  }
+}

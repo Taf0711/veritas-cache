@@ -1,0 +1,117 @@
+#!/bin/sh
+# Run the Phase 6.3 control-loop experiment.
+# Arms: baseline (shadow mode, pass-through), static, ld3.
+# Every arm shares the proxy path so the arms differ in serving only.
+set -e
+
+PORT=18090
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+SUITE="$REPO_ROOT/bench/splice/suite.json"
+TEMPLATE_DIR="$REPO_ROOT/bench/splice/xdg"
+RUNS_DIR="$REPO_ROOT/bench/splice/runs"
+PROXY_BIN="$REPO_ROOT/target/release/veritas-cache"
+MODEL="${SPLICE_EXPERIMENT_MODEL:-openai/gpt-4o-mini}"
+
+# The proxy resolves its model files relative to the working directory.
+cd "$REPO_ROOT"
+
+DRY_RUN=0
+if [ "${1:-}" = "--dry-run" ]; then
+    DRY_RUN=1
+fi
+
+# Fail fast when the tools are missing.
+if ! command -v splice >/dev/null 2>&1; then
+    echo "FAIL splice is not on PATH"
+    exit 1
+fi
+# A real run needs the upstream key. The key never lands in a file.
+# The fixture config names the env var. Splice reads it from its own environment.
+# Dry-run mode makes no upstream calls, so it skips this check.
+if [ "$DRY_RUN" = "0" ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
+    echo "FAIL OPENROUTER_API_KEY is not set"
+    exit 1
+fi
+
+cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" --quiet
+
+# Render the XDG fixture into a fresh directory.
+# The model value contains a slash, so sed uses a pipe delimiter.
+if [ "$DRY_RUN" = "1" ]; then
+    WORK_DIR=$(mktemp -d)
+else
+    WORK_DIR="$RUNS_DIR/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$WORK_DIR"
+fi
+XDG_DIR="$WORK_DIR/xdg"
+mkdir -p "$XDG_DIR/splice"
+for TEMPLATE in config.json stage-models.json; do
+    sed "s|__MODEL__|$MODEL|g" "$TEMPLATE_DIR/$TEMPLATE.template" > "$XDG_DIR/splice/$TEMPLATE"
+done
+
+if [ "$DRY_RUN" = "1" ]; then
+    trap 'kill $PROXY_PID 2>/dev/null || true; rm -rf "$WORK_DIR"' EXIT
+else
+    ln -sfn "$WORK_DIR" "$RUNS_DIR/latest"
+    # Kill the proxy on any failure so the port is free for the next run.
+    trap 'kill $PROXY_PID 2>/dev/null || true' EXIT
+fi
+
+# Validate the suite offline before any run.
+splice eval --suite "$SUITE"
+echo "PASS suite validates"
+
+# Start the proxy for one arm. Wait for health. Run nothing without health.
+start_proxy() {
+    ARM="$1"
+    shift
+    ARM_DIR="$WORK_DIR/$ARM"
+    mkdir -p "$ARM_DIR"
+    env PORT="$PORT" \
+        CACHE_DB_PATH="$ARM_DIR/cache.db" \
+        UPSTREAM_BASE_URL="https://openrouter.ai/api/v1" \
+        "$@" "$PROXY_BIN" > "$ARM_DIR/proxy.log" 2>&1 &
+    PROXY_PID=$!
+    WAITED=0
+    until [ "$(curl -sS "http://127.0.0.1:$PORT/health" 2>/dev/null)" = "ok" ]; do
+        sleep 1
+        WAITED=$((WAITED + 1))
+        if [ "$WAITED" -ge 60 ]; then
+            echo "FAIL proxy for arm $ARM did not become ready"
+            exit 1
+        fi
+    done
+    echo "PASS proxy up for arm $ARM"
+}
+
+stop_proxy() {
+    kill "$PROXY_PID" 2>/dev/null || true
+    wait "$PROXY_PID" 2>/dev/null || true
+}
+
+if [ "$DRY_RUN" = "1" ]; then
+    start_proxy baseline CACHE_SHADOW=1
+    stop_proxy
+    echo "DRY RUN OK"
+    exit 0
+fi
+
+# Each arm runs the same suite against the same proxy port.
+for ARM in baseline static ld3; do
+    case "$ARM" in
+        baseline) FLAGS="CACHE_SHADOW=1" ;;
+        static)   FLAGS="SEMANTIC_POLICY=static" ;;
+        ld3)      FLAGS="SEMANTIC_POLICY=ld3" ;;
+    esac
+    start_proxy "$ARM" $FLAGS
+    env XDG_CONFIG_HOME="$XDG_DIR" splice eval bench \
+        --suite "$SUITE" \
+        --report-dir "$WORK_DIR/$ARM" \
+        --timeout 5m \
+        --agent-command env XDG_CONFIG_HOME="$XDG_DIR" splice exec -C {workspace} "{prompt}"
+    stop_proxy
+    echo "PASS arm $ARM finished"
+done
+
+echo "Run dir: $WORK_DIR"
+echo "Compare with: python3 $REPO_ROOT/bench/splice/diff_arms.py"

@@ -19,3 +19,4 @@ cache.db*
 
 # Python bytecode
 __pycache__/
+bench/splice/runs/

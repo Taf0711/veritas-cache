@@ -1,0 +1,12 @@
+{
+  "activeProvider": "veritas",
+  "providers": [
+    {
+      "name": "veritas",
+      "provider_kind": "openai-compatible",
+      "baseURL": "http://127.0.0.1:18090/v1",
+      "apiKeyEnv": "OPENROUTER_API_KEY",
+      "model": "__MODEL__"
+    }
+  ]
+}

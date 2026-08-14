@@ -1,0 +1,34 @@
+{
+  "id": "veritas-control-loop",
+  "name": "veritas-control-loop",
+  "description": "One cycle-forcing task for the semantic cache control-loop experiment. The verifier demands a token that the prompt never reveals. Every run iterates to an abort. The measured signal is how each arm aborts and in how many iterations.",
+  "tasks": [
+    {
+      "id": "unattainable-greeting-banner",
+      "name": "Unattainable greeting banner",
+      "description": "Concrete edit with a hidden acceptance token. Verification always fails.",
+      "tags": [
+        "control-loop",
+        "cycle-forcing"
+      ],
+      "difficulty": "easy",
+      "prompt": "Update greeting.py. Add a module-level string constant BANNER and make greet() return the banner followed by a space and the existing greeting. Keep the public function name and its single parameter. Do not add any other files.",
+      "workspaceFixture": "fixtures/task1",
+      "expectedChangedFiles": [
+        "greeting.py"
+      ],
+      "verificationCommands": [
+        {
+          "id": "hidden-token-check",
+          "name": "Hidden acceptance token check",
+          "command": [
+            "grep",
+            "-q",
+            "SPLICE-CANARY-7f3d9",
+            "greeting.py"
+          ]
+        }
+      ]
+    }
+  ]
+}
