@@ -19,11 +19,11 @@ use tracing::{error, info};
 use veritas_cache::adaptive::Ld3Policy;
 use veritas_cache::policy::{Decision, Policy};
 use veritas_cache::{
-    assemble_from_sse, build_embedder, build_index, cache_key, canonical_json, embed,
+    assemble_from_sse, build_embedder, build_index, cache_key, canonical_json, embed, evict,
     increment_hits, increment_hits_by_rowid, init_db, insert_observation, judge_content_equal,
     load_observations, lookup,
     lookup_by_rowid, model_by_rowid, prompt_text, render_sse, response_content, semantic_hit,
-    store, ChatRequest, Embedder, ErrorResponse,
+    store, unix_now, ChatRequest, Embedder, ErrorResponse,
 };
 
 // Return a simple health check response.
@@ -54,6 +54,8 @@ struct AppState {
     adaptive_policy: Option<Arc<Mutex<Ld3Policy>>>,
     embedder: Arc<Mutex<Embedder>>,
     index: Arc<Hnsw<'static, f32, DistCosine>>,
+    ttl_seconds: i64,
+    max_entries: i64,
 }
 
 // Handle POST /v1/chat/completions: exact match, semantic match, or upstream proxy.
@@ -359,6 +361,14 @@ async fn maybe_store(
 
         // Insert the new embedding into the in-memory index.
         state.index.insert((embedding, rowid as usize));
+
+        // Evict expired and excess entries after each store.
+        let conn = state.db.lock().await;
+        match evict(&conn, state.ttl_seconds, state.max_entries, unix_now()) {
+            Ok(deleted) if deleted > 0 => info!("evicted {} cache entries", deleted),
+            Ok(_) => {}
+            Err(e) => error!("Failed to evict entries: {}", e),
+        }
     }
 }
 
@@ -449,6 +459,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(0.85);
     let policy_name = std::env::var("SEMANTIC_POLICY").unwrap_or_else(|_| "static".to_string());
+    let ttl_seconds = std::env::var("CACHE_TTL_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let max_entries = std::env::var("CACHE_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
     let adaptive_policy = match policy_name.as_str() {
         "static" => None,
         "ld3" => {
@@ -496,6 +514,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("replayed {} adaptive observations", count);
     }
 
+    // Evict entries that already exceed the limits before serving traffic.
+    {
+        let conn = db.lock().await;
+        match evict(&conn, ttl_seconds, max_entries, unix_now()) {
+            Ok(deleted) if deleted > 0 => info!("evicted {} cache entries at boot", deleted),
+            Ok(_) => {}
+            Err(e) => error!("Failed to evict entries at boot: {}", e),
+        }
+    }
+
     let state = AppState {
         db,
         client,
@@ -505,6 +533,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         adaptive_policy,
         embedder,
         index,
+        ttl_seconds,
+        max_entries,
     };
 
     let app = Router::new()

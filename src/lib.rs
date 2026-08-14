@@ -454,7 +454,16 @@ pub fn semantic_hit(similarity: f32, threshold: f32) -> bool {
     similarity >= threshold
 }
 
-// Create the cache table if it does not exist and switch to WAL mode.
+// Return the current unix time in seconds.
+pub fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+// Create the cache tables if they do not exist and switch to WAL mode.
+// Add the last_accessed_at column to databases that predate it.
 pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute(
@@ -465,10 +474,29 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
             created_at INTEGER NOT NULL,
             hit_count INTEGER NOT NULL DEFAULT 0,
             model TEXT NOT NULL,
-            embedding BLOB NOT NULL
+            embedding BLOB NOT NULL,
+            last_accessed_at INTEGER NOT NULL DEFAULT 0
         )",
         [],
     )?;
+    let has_column = {
+        let mut stmt = conn.prepare("PRAGMA table_info(entries)")?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "last_accessed_at" {
+                found = true;
+            }
+        }
+        found
+    };
+    if !has_column {
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN last_accessed_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     conn.execute(
         "CREATE TABLE IF NOT EXISTS observations (
             entry_rowid INTEGER NOT NULL,
@@ -501,20 +529,20 @@ pub fn model_by_rowid(conn: &Connection, rowid: i64) -> rusqlite::Result<Option<
         .optional()
 }
 
-// Increase the hit counter for a cached entry.
+// Increase the hit counter for a cached entry and record the access time.
 pub fn increment_hits(conn: &Connection, key: &str) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE entries SET hit_count = hit_count + 1 WHERE key_hash = ?1",
-        [key],
+        "UPDATE entries SET hit_count = hit_count + 1, last_accessed_at = ?2 WHERE key_hash = ?1",
+        params![key, unix_now()],
     )?;
     Ok(())
 }
 
-// Increase the hit counter for a semantic match.
+// Increase the hit counter for a semantic match and record the access time.
 pub fn increment_hits_by_rowid(conn: &Connection, rowid: i64) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE entries SET hit_count = hit_count + 1 WHERE rowid = ?1",
-        [rowid],
+        "UPDATE entries SET hit_count = hit_count + 1, last_accessed_at = ?2 WHERE rowid = ?1",
+        params![rowid, unix_now()],
     )?;
     Ok(())
 }
@@ -557,14 +585,11 @@ pub fn store(
     model: &str,
     embedding: &[f32],
 ) -> rusqlite::Result<i64> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+    let now = unix_now();
     conn.execute(
         "INSERT OR REPLACE INTO entries
-         (key_hash, request_json, response_json, created_at, hit_count, model, embedding)
-         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+         (key_hash, request_json, response_json, created_at, hit_count, model, embedding, last_accessed_at)
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?4)",
         params![
             key,
             request_json,
@@ -575,6 +600,56 @@ pub fn store(
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+// Delete expired and least recently used entries from the cache.
+// A ttl_seconds of 0 disables expiry. A max_entries of 0 disables the cap.
+// Delete the observations of each removed entry as well.
+// Return the number of deleted entries.
+pub fn evict(
+    conn: &Connection,
+    ttl_seconds: i64,
+    max_entries: i64,
+    now_unix: i64,
+) -> rusqlite::Result<usize> {
+    let mut dead: Vec<i64> = Vec::new();
+    if ttl_seconds > 0 {
+        let cutoff = now_unix - ttl_seconds;
+        let mut stmt = conn.prepare("SELECT rowid FROM entries WHERE created_at < ?1")?;
+        let mut rows = stmt.query([cutoff])?;
+        while let Some(row) = rows.next()? {
+            dead.push(row.get(0)?);
+        }
+    }
+    delete_entries(conn, &dead)?;
+    let mut deleted = dead.len();
+
+    if max_entries > 0 {
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM entries", [], |row| row.get(0))?;
+        let excess = count - max_entries;
+        if excess > 0 {
+            let mut victims: Vec<i64> = Vec::new();
+            let mut stmt = conn.prepare(
+                "SELECT rowid FROM entries ORDER BY last_accessed_at ASC, rowid ASC LIMIT ?1",
+            )?;
+            let mut rows = stmt.query([excess])?;
+            while let Some(row) = rows.next()? {
+                victims.push(row.get(0)?);
+            }
+            delete_entries(conn, &victims)?;
+            deleted += victims.len();
+        }
+    }
+    Ok(deleted)
+}
+
+// Delete the given entries and their observations by rowid.
+fn delete_entries(conn: &Connection, rowids: &[i64]) -> rusqlite::Result<()> {
+    for rowid in rowids {
+        conn.execute("DELETE FROM entries WHERE rowid = ?1", [rowid])?;
+        conn.execute("DELETE FROM observations WHERE entry_rowid = ?1", [rowid])?;
+    }
+    Ok(())
 }
 
 // Build the in-memory HNSW index from stored embeddings.
@@ -817,6 +892,95 @@ mod tests {
         assert_eq!(for_eleven.len(), 1);
         assert!((for_eleven[0].1 - 0.88).abs() < 1e-6);
         assert!(for_eleven[0].2);
+    }
+
+    // Insert one entry with explicit timestamps. Return its rowid.
+    fn insert_entry(conn: &Connection, key: &str, created_at: i64, last_accessed_at: i64) -> i64 {
+        conn.execute(
+            "INSERT INTO entries
+             (key_hash, request_json, response_json, created_at, hit_count, model, embedding, last_accessed_at)
+             VALUES (?1, '{}', '{}', ?2, 0, 'mock', ?3, ?4)",
+            params![key, created_at, embedding_to_blob(&[1.0, 0.0]), last_accessed_at],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn evict_expires_old_entries_and_their_observations() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let now = 1_000_000;
+        let old = insert_entry(&conn, "old", 1_000, 1_000);
+        let fresh = insert_entry(&conn, "fresh", 999_999, 999_999);
+        insert_observation(&conn, old, 0.9, true).unwrap();
+        insert_observation(&conn, fresh, 0.8, false).unwrap();
+
+        let deleted = evict(&conn, 3600, 0, now).unwrap();
+        assert_eq!(deleted, 1);
+        assert!(lookup_by_rowid(&conn, old).unwrap().is_none());
+        assert!(lookup_by_rowid(&conn, fresh).unwrap().is_some());
+        let observations = load_observations(&conn).unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].0, fresh);
+    }
+
+    #[test]
+    fn evict_keeps_the_most_recently_accessed_entries() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let oldest = insert_entry(&conn, "a", 100, 100);
+        let middle = insert_entry(&conn, "b", 100, 200);
+        let newest = insert_entry(&conn, "c", 100, 300);
+        insert_observation(&conn, oldest, 0.9, true).unwrap();
+
+        let deleted = evict(&conn, 0, 2, 1_000).unwrap();
+        assert_eq!(deleted, 1);
+        assert!(lookup_by_rowid(&conn, oldest).unwrap().is_none());
+        assert!(lookup_by_rowid(&conn, middle).unwrap().is_some());
+        assert!(lookup_by_rowid(&conn, newest).unwrap().is_some());
+        assert!(load_observations(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn init_db_adds_last_accessed_at_to_old_databases() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE entries (
+                key_hash TEXT PRIMARY KEY,
+                request_json TEXT NOT NULL,
+                response_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                hit_count INTEGER NOT NULL DEFAULT 0,
+                model TEXT NOT NULL,
+                embedding BLOB NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+        let rowid = insert_entry(&conn, "a", 5, 7);
+        assert!(lookup_by_rowid(&conn, rowid).unwrap().is_some());
+        let accessed: i64 = conn
+            .query_row(
+                "SELECT last_accessed_at FROM entries WHERE rowid = ?1",
+                [rowid],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(accessed, 7);
+    }
+
+    #[test]
+    fn evict_with_zero_limits_is_a_no_op() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let rowid = insert_entry(&conn, "a", 1, 1);
+
+        let deleted = evict(&conn, 0, 0, 1_000_000).unwrap();
+        assert_eq!(deleted, 0);
+        assert!(lookup_by_rowid(&conn, rowid).unwrap().is_some());
     }
 
     #[test]
