@@ -51,6 +51,44 @@ closes that hole on this trace.
   reached for `python` where only `python3` exists. Equal across arms. Not part of the
   cache comparison.
 
+## Run 2 — write-forcing task added (run dir 20260814-160756)
+
+Two tasks per arm. Task 2 (write-forcing-release-channel) requires a visible file edit.
+A hidden token keeps the run failing. Task 1 replicated its run-1 signature and is not
+repeated here.
+
+Task 2 measured results:
+
+| arm | hits served | write_file calls | abort reason |
+|---|---|---|---|
+| baseline | 0 | 9 | `abort_budget: Token budget reached.` |
+| static | 99 across both tasks | 50 | `abort_hard_limit: Maximum iteration count reached.` |
+| ld3 | 6 across both tasks | 6 | stage capability error, see below |
+
+### The monitor did not fire on forced identical writes
+
+The static arm wrote the file 50 times from byte-identical served responses. Consecutive
+file states were identical. No escalation marker appeared in any arm on either task. The
+cycle detection this setup was built to trigger stayed silent. Thrash is not required to
+evade it. Even a manufactured identical-write loop evades it.
+
+### The budget-brake finding replicated
+
+Static serving again converted the exit into the hard iteration cap. 50 writes against 9
+in baseline. About 5.5 times the work on task 2, 7 times on task 1 in run 1.
+
+### Open anomaly: ld3 task 2 ended on a stage capability error
+
+The ld3 arm served 6 hits, then ended task 2 early with: select a model that supports
+tool calling through the configured API. Two candidate causes. The cache served a response
+without the forced tool call shape to a stage that requires one. Or the fixture model id
+fails a Splice-side capability check when the step_back stage activates. Baseline and
+static did not hit this. One sample. Unresolved.
+
+### Caveats for run 2
+
+Same as run 1. One run per arm. No variance estimate.
+
 ## Reproduce
 
 ```bash
