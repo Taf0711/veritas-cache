@@ -76,7 +76,7 @@
         "functionality"
       ],
       "difficulty": "easy",
-      "prompt": "Update math_helpers.py. Add a function double(x) that returns x * 2. Keep the existing code unchanged. Do not add any other files.",
+      "prompt": "Update math_helpers.py. Add a function double(x) that returns x * 2. Keep the existing code unchanged. Do not add any other files. Verify your change with python3. The python command does not exist on this system.",
       "workspaceFixture": "fixtures/task3",
       "expectedChangedFiles": [
         "math_helpers.py"
@@ -101,7 +101,7 @@
         "functionality"
       ],
       "difficulty": "easy",
-      "prompt": "Update text_utils.py. The function first_word crashes on an empty string. Make it return an empty string for empty input. Keep every other behavior unchanged. Do not add any other files.",
+      "prompt": "Update text_utils.py. The function first_word crashes on an empty string. Make it return an empty string for empty input. Keep every other behavior unchanged. Do not add any other files. Verify your change with python3. The python command does not exist on this system.",
       "workspaceFixture": "fixtures/task4",
       "expectedChangedFiles": [
         "text_utils.py"

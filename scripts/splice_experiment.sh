@@ -11,7 +11,14 @@ SUITE="$REPO_ROOT/bench/splice/suite.json"
 TEMPLATE_DIR="$REPO_ROOT/bench/splice/xdg"
 RUNS_DIR="$REPO_ROOT/bench/splice/runs"
 PROXY_BIN="$REPO_ROOT/target/release/veritas-cache"
-SPLICE_BIN="${SPLICE_BIN:-splice}"
+# Prefer the dev build from bench/splice/bin. Fall back to the splice on PATH.
+if [ -z "${SPLICE_BIN:-}" ]; then
+    if [ -x "$REPO_ROOT/bench/splice/bin/splice" ]; then
+        SPLICE_BIN="$REPO_ROOT/bench/splice/bin/splice"
+    else
+        SPLICE_BIN="splice"
+    fi
+fi
 MODEL="${SPLICE_EXPERIMENT_MODEL:-openai/gpt-4o-mini}"
 
 # The proxy resolves its model files relative to the working directory.
