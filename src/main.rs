@@ -19,11 +19,12 @@ use tracing::{error, info};
 use veritas_cache::adaptive::Ld3Policy;
 use veritas_cache::policy::{Decision, Policy};
 use veritas_cache::{
-    assemble_from_sse, build_embedder, build_index, cache_key, canonical_json, embed, evict,
-    increment_hits, increment_hits_by_rowid, init_db, insert_observation, judge_content_equal,
-    load_observations, lookup,
-    lookup_by_rowid, model_by_rowid, prompt_text, render_sse, response_content, semantic_hit,
-    store, unix_now, ChatRequest, Embedder, ErrorResponse,
+    assemble_from_sse, build_embedder, build_index, cache_key, canonical_json, count_tokens,
+    embed, evict, increment_hits, increment_hits_by_rowid, init_db, insert_observation,
+    judge_content_equal, load_observations, lookup,
+    lookup_by_rowid, model_by_rowid, parse_exact_only_models, prompt_text, render_sse,
+    response_content, semantic_hit, store, synthesize_usage, unix_now, ChatRequest, Embedder,
+    ErrorResponse,
 };
 
 // Return a simple health check response.
@@ -56,6 +57,7 @@ struct AppState {
     index: Arc<Hnsw<'static, f32, DistCosine>>,
     ttl_seconds: i64,
     max_entries: i64,
+    exact_only_models: std::collections::HashSet<String>,
 }
 
 // Handle POST /v1/chat/completions: exact match, semantic match, or upstream proxy.
@@ -106,11 +108,16 @@ async fn chat_completions(
             error!("Failed to update hit count: {}", e);
         }
         info!("cache exact hit for key {}", key);
-        return serve_hit(&state, &request, response_json, "exact", None);
+        return serve_hit(&state, &request, response_json, "exact", None).await;
     }
 
+    // Exact-only models skip the semantic path. They still store for exact reuse.
+    let exact_only = state.exact_only_models.contains(&request.model);
+
     // Embed the request prompt.
-    let embedding = {
+    let embedding = if exact_only {
+        Vec::new()
+    } else {
         let prompt = prompt_text(&request);
         let mut embedder = state.embedder.lock().await;
         match embed(&mut embedder, &prompt) {
@@ -123,7 +130,9 @@ async fn chat_completions(
     };
 
     // Search the HNSW index and post-filter by model.
-    let best_match = {
+    let best_match = if exact_only {
+        None
+    } else {
         let conn = state.db.lock().await;
         let mut best: Option<(i64, f32)> = None;
         for neighbour in state.index.search(&embedding, 5, 32) {
@@ -150,7 +159,9 @@ async fn chat_completions(
     };
 
     // Decide whether the semantic neighbor is a hit.
-    let semantic_decision = if state.policy_name == "ld3" {
+    let semantic_decision = if exact_only {
+        Decision::Miss
+    } else if state.policy_name == "ld3" {
         let mut policy = state
             .adaptive_policy
             .as_ref()
@@ -196,7 +207,7 @@ async fn chat_completions(
                 "cache semantic hit for key {} with similarity {}",
                 key, similarity
             );
-            return serve_hit(&state, &request, response_json, "semantic", Some(similarity));
+            return serve_hit(&state, &request, response_json, "semantic", Some(similarity)).await;
         }
     }
 
@@ -255,13 +266,25 @@ async fn chat_completions(
 }
 
 // Serve a cached response. Streaming requests get an SSE stream.
-fn serve_hit(
+// Rewrite the usage first so the hit reports plausible tokens.
+async fn serve_hit(
     state: &AppState,
     request: &ChatRequest,
     response_json: String,
     match_kind: &str,
     similarity: Option<f32>,
 ) -> Response {
+    let response_json = {
+        let prompt = prompt_text(request);
+        let embedder = state.embedder.lock().await;
+        match count_tokens(&embedder, &prompt) {
+            Ok(prompt_tokens) => synthesize_usage(&response_json, prompt_tokens),
+            Err(e) => {
+                error!("Failed to count prompt tokens: {}", e);
+                response_json
+            }
+        }
+    };
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("x-cache", "HIT")
@@ -360,7 +383,9 @@ async fn maybe_store(
         };
 
         // Insert the new embedding into the in-memory index.
-        state.index.insert((embedding, rowid as usize));
+        if !embedding.is_empty() {
+            state.index.insert((embedding, rowid as usize));
+        }
 
         // Evict expired and excess entries after each store.
         let conn = state.db.lock().await;
@@ -467,6 +492,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(0);
+    let exact_only_models =
+        parse_exact_only_models(&std::env::var("CACHE_EXACT_ONLY_MODELS").unwrap_or_default());
     let adaptive_policy = match policy_name.as_str() {
         "static" => None,
         "ld3" => {
@@ -535,6 +562,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         index,
         ttl_seconds,
         max_entries,
+        exact_only_models,
     };
 
     let app = Router::new()

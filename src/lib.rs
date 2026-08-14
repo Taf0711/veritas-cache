@@ -358,6 +358,44 @@ pub fn build_embedder() -> Result<Embedder, Box<dyn std::error::Error + Send + S
     Ok(Embedder { tokenizer, session })
 }
 
+// Count the tokens of a text with the embedding tokenizer.
+pub fn count_tokens(embedder: &Embedder, text: &str) -> Result<usize, String> {
+    let encoding = embedder.tokenizer.encode(text, false).map_err(|e| e.to_string())?;
+    Ok(encoding.get_ids().len())
+}
+
+// Parse a comma-separated list of exact-only model names.
+pub fn parse_exact_only_models(value: &str) -> std::collections::HashSet<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+// Rewrite the usage of a cached response for a new request.
+// Prompt tokens come from the new request. Completion tokens stay from the stored response.
+// Return the input unchanged when the response has no usage object.
+pub fn synthesize_usage(response_json: &str, prompt_tokens: usize) -> String {
+    let Ok(mut value) = serde_json::from_str::<Value>(response_json) else {
+        return response_json.to_string();
+    };
+    let Some(usage) = value.get_mut("usage").and_then(Value::as_object_mut) else {
+        return response_json.to_string();
+    };
+    let completion = usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    usage.insert("prompt_tokens".to_string(), Value::from(prompt_tokens as u64));
+    usage.insert(
+        "total_tokens".to_string(),
+        Value::from(prompt_tokens as u64 + completion),
+    );
+    value.to_string()
+}
+
 // Compute a sentence embedding.
 // Tokenize the prompt, run the ONNX model, mean pool the last hidden state, and L2-normalize.
 pub fn embed(
@@ -432,7 +470,7 @@ pub fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
 
 // Convert a little-endian f32 blob back into a vector.
 pub fn embedding_from_blob(blob: &[u8]) -> Option<Vec<f32>> {
-    if blob.len() % 4 != 0 {
+    if blob.is_empty() || blob.len() % 4 != 0 {
         return None;
     }
     let mut out = Vec::with_capacity(blob.len() / 4);
@@ -721,6 +759,65 @@ mod tests {
         .unwrap();
 
         assert_eq!(cache_key(&req_a).unwrap(), cache_key(&req_b).unwrap());
+    }
+
+    #[test]
+    fn embedding_from_blob_rejects_empty_and_misaligned_blobs() {
+        assert!(embedding_from_blob(&[]).is_none());
+        assert!(embedding_from_blob(&[0, 1, 2]).is_none());
+        assert!(embedding_from_blob(&[0, 0, 0, 0]).is_some());
+    }
+
+    #[test]
+    fn cache_key_differs_by_tool_choice() {
+        let forced: ChatRequest = serde_json::from_value(json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "call the tool"}],
+            "tool_choice": {"type": "function", "function": {"name": "run"}}
+        }))
+        .unwrap();
+        let auto: ChatRequest = serde_json::from_value(json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "call the tool"}],
+            "tool_choice": "auto"
+        }))
+        .unwrap();
+        let plain: ChatRequest = serde_json::from_value(json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "call the tool"}]
+        }))
+        .unwrap();
+
+        let forced_key = cache_key(&forced).unwrap();
+        assert_ne!(forced_key, cache_key(&auto).unwrap());
+        assert_ne!(forced_key, cache_key(&plain).unwrap());
+    }
+
+    #[test]
+    fn synthesize_usage_rewrites_prompt_and_total() {
+        let stored = json!({
+            "id": "chatcmpl-1",
+            "choices": [],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+        let rewritten = synthesize_usage(&stored.to_string(), 42);
+        let value: Value = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(value["usage"]["prompt_tokens"], 42);
+        assert_eq!(value["usage"]["completion_tokens"], 5);
+        assert_eq!(value["usage"]["total_tokens"], 47);
+
+        // A response without usage stays unchanged.
+        let bare = json!({"id": "chatcmpl-2", "choices": []});
+        assert_eq!(synthesize_usage(&bare.to_string(), 42), bare.to_string());
+    }
+
+    #[test]
+    fn parse_exact_only_models_trims_and_drops_empty() {
+        let set = parse_exact_only_models(" gpt-4o-mini , ,gpt-4o,");
+        assert!(set.contains("gpt-4o-mini"));
+        assert!(set.contains("gpt-4o"));
+        assert_eq!(set.len(), 2);
+        assert!(parse_exact_only_models("").is_empty());
     }
 
     #[test]
