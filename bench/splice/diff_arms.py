@@ -48,9 +48,12 @@ def load_arm(run_dir, arm):
 
 
 def abort_reason(report):
-    """Pull the abort reason from the failure record. Empty when absent."""
+    """Pull the abort reason from the failure record or the stream-json stdout."""
     failures = report.get("failures") or []
     text = "\n".join(f.get("message", "") for f in failures)
+    benchmark = report.get("benchmark") or {}
+    for task in benchmark.get("tasks") or []:
+        text += "\n" + (task.get("agent") or {}).get("stdout", "")
     match = re.search(r"abort_\w+: [^\n.]*", text)
     return match.group(0) if match else ""
 

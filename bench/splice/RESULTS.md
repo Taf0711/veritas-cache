@@ -105,6 +105,44 @@ Run 3 will use a fixture binary built from splice dev ee5a404.
 
 Same as run 1. One run per arm. No variance estimate.
 
+## Run 3 — dev binary, stream-json capture (run dir 20260814-161810)
+
+Fixture binary rebuilt from splice dev ee5a404. Stage breakdowns and usage samples are
+present again. Two tasks per arm.
+
+### Measured results
+
+| arm | hits served | iterations per stage (task 1 / task 2) | abort reason |
+|---|---|---|---|
+| baseline | 0 | 8 / 8 | `abort_budget: Token budget reached.` |
+| static | 99 | 50 / 50 | `abort_hard_limit: Maximum iteration count reached.` |
+| ld3 | 21 | 13 / 18 | `abort_budget: Token budget reached.` |
+
+Every arm on every task emitted exactly one escalation line: "no escalation provider
+configured (continuing without escalation)". The run then continued to its own exit.
+
+### Reading
+
+The cycle rule fired in every arm, including baseline. The write-forcing task itself
+manufactures StateHash cycles: a competent model repeats the same correct edit every
+iteration, so consecutive file states repeat with or without a cache. Cycle detection
+cannot separate cache-induced cycles from task-induced ones.
+
+The budget-brake finding holds on the current binary. Static serving removed the brake and
+ran to the 50-iteration hard cap. Baseline stopped at 8 iterations on budget. The
+amplification is 6.25 times. ld3 served 21 hits across both tasks with 16 of 16 judged
+observations correct, and its iterations (13 and 18) stayed near baseline. The served
+responses were content-equivalent to fresh ones on this traffic, so the adaptive policy
+correctly kept serving at a bounded rate.
+
+The escalation-without-target finding is now observed in the wild. Every arm continued
+past its escalation to its own exit mode. The monitor fires. Nothing acts on it.
+
+### Caveats for run 3
+
+One run per arm. The iteration counts and abort reasons are single samples. The escalation
+marker count comes from the stream-json stdout.
+
 ## Reproduce
 
 ```bash
