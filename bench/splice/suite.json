@@ -29,6 +29,44 @@
           ]
         }
       ]
+    },
+    {
+      "id": "write-forcing-release-channel",
+      "name": "Write-forcing release channel",
+      "description": "The verifier records whether the model writes the file. A hidden token keeps the run failing so iterations continue.",
+      "tags": [
+        "control-loop",
+        "cycle-forcing",
+        "write-forcing"
+      ],
+      "difficulty": "easy",
+      "prompt": "Update config.py. Add a module-level string constant RELEASE_CHANNEL and make channel() return it instead of the literal. Keep the function name and its zero parameters. Do not add any other files.",
+      "workspaceFixture": "fixtures/task2",
+      "expectedChangedFiles": [
+        "config.py"
+      ],
+      "verificationCommands": [
+        {
+          "id": "visible-write-check",
+          "name": "Visible write check",
+          "command": [
+            "grep",
+            "-q",
+            "RELEASE_CHANNEL",
+            "config.py"
+          ]
+        },
+        {
+          "id": "hidden-token-check",
+          "name": "Hidden acceptance token check",
+          "command": [
+            "grep",
+            "-q",
+            "SPLICE-CANARY-9b2e1",
+            "config.py"
+          ]
+        }
+      ]
     }
   ]
 }

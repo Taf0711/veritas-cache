@@ -68,6 +68,11 @@ def task_rows(report):
             for stage in agent.get("stages", [])
             if stage.get("name")
         }
+        checks = [
+            (r.get("id", "?"), r.get("status", "?"))
+            for r in scoring.get("results", [])
+            if r.get("kind") == "command"
+        ]
         rows.append(
             {
                 "task": task.get("taskId", "?"),
@@ -77,6 +82,7 @@ def task_rows(report):
                 "escalations": stdout.count("[escalation]"),
                 "latency_ms": task.get("latencyMs", agent.get("latencyMs", "?")),
                 "stage_iterations": stages,
+                "checks": checks,
             }
         )
     return rows
@@ -116,6 +122,8 @@ def main():
                 print(f"    error: {row['error']}")
             for name, iteration in sorted(row["stage_iterations"].items()):
                 print(f"    stage {name}: iterations={iteration}")
+            for check_id, check_status in row["checks"]:
+                print(f"    check {check_id}: {check_status}")
     return 0
 
 
