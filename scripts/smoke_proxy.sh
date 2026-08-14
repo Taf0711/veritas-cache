@@ -127,6 +127,45 @@ else
     fail "streaming hit body did not end with DONE"
 fi
 
+# A client that closes the connection at [DONE] must still have its response cached.
+BODY_EARLY="$WORK_DIR/body_early.json"
+cat > "$BODY_EARLY" <<'EOF'
+{"model":"gpt-4o-mini","messages":[{"role":"user","content":"early close probe"}],"stream":true}
+EOF
+python3 - "$PROXY_URL" "$BODY_EARLY" <<'PYEOF'
+import http.client, json, sys
+url, body_path = sys.argv[1], sys.argv[2]
+host = url.split("//", 1)[1].split(":")[0]
+port = int(url.rsplit(":", 1)[1])
+body = open(body_path, "rb").read()
+conn = http.client.HTTPConnection(host, port)
+conn.request("POST", "/v1/chat/completions", body=body,
+             headers={"Content-Type": "application/json"})
+resp = conn.getresponse()
+data = b""
+while b"[DONE]" not in data:
+    chunk = resp.read1(4096)
+    if not chunk:
+        break
+    data += chunk
+conn.close()
+PYEOF
+EARLY_HIT=0
+for TRY in 1 2 3 4 5; do
+    curl -sS -D "$HEADERS_FILE" -o /dev/null -X POST \
+        -H "Content-Type: application/json" --data-binary "@$BODY_EARLY" "$PROXY_URL/v1/chat/completions"
+    if grep -q "^x-cache: HIT" "$HEADERS_FILE"; then
+        EARLY_HIT=1
+        break
+    fi
+    sleep 1
+done
+if [ "$EARLY_HIT" = "1" ]; then
+    echo "PASS early-close streaming request is cached"
+else
+    fail "early-close streaming request was not cached"
+fi
+
 # Exact-only mode: restart the proxy with the model marked exact-only.
 kill "$PROXY_PID" 2>/dev/null || true
 wait "$PROXY_PID" 2>/dev/null || true

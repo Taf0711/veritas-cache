@@ -104,11 +104,12 @@ for ARM in baseline static ld3; do
         ld3)      FLAGS="SEMANTIC_POLICY=ld3" ;;
     esac
     start_proxy "$ARM" $FLAGS
+    # The task fails by design, so eval bench exits non-zero. The report is the output.
     env XDG_CONFIG_HOME="$XDG_DIR" splice eval bench \
         --suite "$SUITE" \
         --report-dir "$WORK_DIR/$ARM" \
         --timeout 5m \
-        --agent-command env XDG_CONFIG_HOME="$XDG_DIR" splice exec -C {workspace} "{prompt}"
+        --agent-command env XDG_CONFIG_HOME="$XDG_DIR" splice exec -C {workspace} "{prompt}" || true
     stop_proxy
     echo "PASS arm $ARM finished"
 done

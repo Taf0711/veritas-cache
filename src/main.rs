@@ -540,6 +540,7 @@ async fn stream_and_cache(
     tokio::spawn(async move {
         let mut stream = upstream_response.bytes_stream();
         let mut failed = false;
+        let mut client_gone = false;
         while let Some(item) = stream.next().await {
             match &item {
                 Ok(bytes) => {
@@ -552,9 +553,10 @@ async fn stream_and_cache(
                     break;
                 }
             }
-            if tx.send(item).await.is_err() {
-                // The client disconnected. Do not cache.
-                return;
+            if !client_gone && tx.send(item).await.is_err() {
+                // The client disconnected early. Real clients often close at [DONE].
+                // Drain the rest of the stream and cache the complete response.
+                client_gone = true;
             }
         }
         if failed {

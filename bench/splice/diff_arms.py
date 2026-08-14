@@ -48,8 +48,9 @@ def load_arm(run_dir, arm):
 
 def task_rows(report):
     """Extract the flat signal columns for each task in one arm report."""
+    benchmark = report.get("benchmark") or {}
     rows = []
-    for task in report.get("tasks", []):
+    for task in benchmark.get("tasks") or []:
         agent = task.get("agent", {})
         scoring = task.get("report", {})
         stdout = agent.get("stdout", "")
