@@ -2,7 +2,8 @@
 
 veritas-cache is an OpenAI-compatible cache proxy. It receives requests from an OpenAI SDK client. It returns a stored response on a cache hit. It forwards the request on a cache miss.
 
-Phase 1 implements exact-match and semantic caching with one static global threshold.
+The proxy supports exact-match and semantic caching. Semantic hits use one static global
+threshold or the adaptive ld3 policy.
 
 ## Requirements
 
@@ -53,6 +54,8 @@ client = OpenAI(
 - `x-cache-match: exact` marks an exact hit. `x-cache-match: semantic` marks a semantic hit.
 - `x-cache-sim: 0.876543` shows the cosine similarity of a semantic hit.
 - `SEMANTIC_THRESHOLD` controls the minimum cosine similarity for a semantic hit. The default is `0.85`.
+- `SEMANTIC_POLICY=ld3` selects the adaptive per-entry policy. `ADAPTIVE_DELTA` sets its error
+  budget. The default policy is `static`.
 
 ## Benchmark
 
@@ -89,7 +92,8 @@ python3 scripts/make_charts.py
 
 ## Status
 
-Phase 1: exact-match and semantic cache proxy with one static threshold. Streaming is not supported yet.
+Phase 1: exact-match and semantic cache proxy with one static threshold. Done. Streaming is
+not supported yet.
 Phase 2: benchmark trace, replay harness, and baseline measurements. Done.
-Phase 3: per-entry adaptive thresholds with a measured error bound. Done. The
-policies are benchmarked in the harness. They are not yet wired into the proxy.
+Phase 3: per-entry adaptive thresholds with a measured error bound. Done. The policies are
+benchmarked in the harness. The ld3 policy is wired into the proxy.
