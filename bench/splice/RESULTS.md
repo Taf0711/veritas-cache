@@ -85,6 +85,22 @@ without the forced tool call shape to a stage that requires one. Or the fixture 
 fails a Splice-side capability check when the step_back stage activates. Baseline and
 static did not hit this. One sample. Unresolved.
 
+### Resolution of the cycle silence (from the Splice side, 2026-08-14)
+
+Splice replicated the cycle on current dev: TestRunEscalatesOnCycle fires the cycle rule at
+iteration 2 with byte-identical stage outputs. Our runs used the npm binary splice 0.2.0,
+which predates commit 6a2f27c (pass and turn limit separation). The 50-iteration writes
+match the retired MaxTurns coupling. The zero-marker observation is a measurement artifact
+of the old binary. The marker text also differs by config: with no escalation provider the
+line reads "no escalation provider configured". Our runs contain zero instances of that
+line too, which fits the old-binary explanation.
+
+One finding survives the correction and stands on its own: when the cycle rule fires but no
+escalation provider is configured, the run continues unchanged to the hard limit. The
+monitor's last recovery lever silently depends on user config.
+
+Run 3 will use a fixture binary built from splice dev ee5a404.
+
 ### Caveats for run 2
 
 Same as run 1. One run per arm. No variance estimate.

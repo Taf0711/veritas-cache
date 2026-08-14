@@ -11,6 +11,7 @@ SUITE="$REPO_ROOT/bench/splice/suite.json"
 TEMPLATE_DIR="$REPO_ROOT/bench/splice/xdg"
 RUNS_DIR="$REPO_ROOT/bench/splice/runs"
 PROXY_BIN="$REPO_ROOT/target/release/veritas-cache"
+SPLICE_BIN="${SPLICE_BIN:-splice}"
 MODEL="${SPLICE_EXPERIMENT_MODEL:-openai/gpt-4o-mini}"
 
 # The proxy resolves its model files relative to the working directory.
@@ -22,8 +23,8 @@ if [ "${1:-}" = "--dry-run" ]; then
 fi
 
 # Fail fast when the tools are missing.
-if ! command -v splice >/dev/null 2>&1; then
-    echo "FAIL splice is not on PATH"
+if ! command -v "$SPLICE_BIN" >/dev/null 2>&1; then
+    echo "FAIL splice binary not found: $SPLICE_BIN"
     exit 1
 fi
 # A real run needs the upstream key. The key never lands in a file.
@@ -59,7 +60,7 @@ else
 fi
 
 # Validate the suite offline before any run.
-splice eval --suite "$SUITE"
+"$SPLICE_BIN" eval --suite "$SUITE"
 echo "PASS suite validates"
 
 # Start the proxy for one arm. Wait for health. Run nothing without health.
@@ -130,7 +131,7 @@ for ARM in baseline static ld3; do
         --suite "$SUITE" \
         --report-dir "$WORK_DIR/$ARM" \
         --timeout 5m \
-        --agent-command env XDG_CONFIG_HOME="$XDG_DIR" splice exec -C {workspace} "{prompt}" || true
+        --agent-command env XDG_CONFIG_HOME="$XDG_DIR" "$SPLICE_BIN" exec -o stream-json -C {workspace} "{prompt}" || true
     stop_proxy
     echo "PASS arm $ARM finished"
 done
