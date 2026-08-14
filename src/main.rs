@@ -7,6 +7,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures_util::stream::unfold;
+use futures_util::StreamExt;
 use hnsw_rs::prelude::*;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use rusqlite::Connection;
@@ -17,9 +19,10 @@ use tracing::{error, info};
 use veritas_cache::adaptive::Ld3Policy;
 use veritas_cache::policy::{Decision, Policy};
 use veritas_cache::{
-    build_embedder, build_index, cache_key, canonical_json, embed, increment_hits,
-    increment_hits_by_rowid, init_db, judge_content_equal, lookup, lookup_by_rowid, model_by_rowid,
-    prompt_text, response_content, semantic_hit, store, ChatRequest, Embedder, ErrorResponse,
+    assemble_from_sse, build_embedder, build_index, cache_key, canonical_json, embed,
+    increment_hits, increment_hits_by_rowid, init_db, judge_content_equal, lookup,
+    lookup_by_rowid, model_by_rowid, prompt_text, render_sse, response_content, semantic_hit,
+    store, ChatRequest, Embedder, ErrorResponse,
 };
 
 // Return a simple health check response.
@@ -72,17 +75,6 @@ async fn chat_completions(
         }
     };
 
-    // Reject streaming requests because Phase 1 does not support them.
-    if request.stream == Some(true) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "Streaming is not supported yet.".to_string(),
-            }),
-        )
-            .into_response();
-    }
-
     let key = match cache_key(&request) {
         Ok(k) => k,
         Err(e) => {
@@ -111,14 +103,7 @@ async fn chat_completions(
             error!("Failed to update hit count: {}", e);
         }
         info!("cache exact hit for key {}", key);
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "application/json")
-            .header("x-cache", "HIT")
-            .header("x-cache-match", "exact")
-            .header("x-cache-policy", &state.policy_name)
-            .body(response_json.into())
-            .unwrap();
+        return serve_hit(&state, &request, response_json, "exact", None);
     }
 
     // Embed the request prompt.
@@ -208,15 +193,7 @@ async fn chat_completions(
                 "cache semantic hit for key {} with similarity {}",
                 key, similarity
             );
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/json")
-                .header("x-cache", "HIT")
-                .header("x-cache-match", "semantic")
-                .header("x-cache-sim", format!("{:.6}", similarity))
-                .header("x-cache-policy", &state.policy_name)
-                .body(response_json.into())
-                .unwrap();
+            return serve_hit(&state, &request, response_json, "semantic", Some(similarity));
         }
     }
 
@@ -243,6 +220,14 @@ async fn chat_completions(
     };
 
     let status = upstream_response.status();
+    let streaming = request.stream == Some(true);
+
+    // A streaming miss passes the upstream body through and caches on completion.
+    if status.is_success() && streaming {
+        return stream_and_cache(state, request, key, embedding, best_match, upstream_response)
+            .await;
+    }
+
     let response_text = match upstream_response.text().await {
         Ok(t) => t,
         Err(e) => {
@@ -253,63 +238,7 @@ async fn chat_completions(
 
     // Cache successful upstream responses only.
     if status.is_success() {
-        let request_json = match serde_json::to_string(&canonical_json(
-            &serde_json::to_value(&request).unwrap_or(Value::Null),
-        )) {
-            Ok(j) => j,
-            Err(e) => {
-                error!("Failed to serialize request: {}", e);
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-
-        let mut should_store = true;
-        if state.policy_name == "ld3" {
-            if let Some((rowid, similarity)) = best_match {
-                let cached_json = {
-                    let conn = state.db.lock().await;
-                    lookup_by_rowid(&conn, rowid).ok().flatten()
-                };
-                if let Some(cached_json) = cached_json {
-                    if response_content(&cached_json).is_some()
-                        && response_content(&response_text).is_some()
-                    {
-                        let correct = judge_content_equal(&cached_json, &response_text);
-                        let mut policy = state
-                            .adaptive_policy
-                            .as_ref()
-                            .expect("ld3 policy")
-                            .lock()
-                            .await;
-                        policy.observe(rowid as usize, similarity, correct);
-                        should_store = policy.should_insert();
-                    }
-                }
-            }
-        }
-
-        if should_store {
-            let rowid = {
-                let conn = state.db.lock().await;
-                match store(
-                    &conn,
-                    &key,
-                    &request_json,
-                    &response_text,
-                    &request.model,
-                    &embedding,
-                ) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        error!("Failed to store response: {}", e);
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                }
-            };
-
-            // Insert the new embedding into the in-memory index.
-            state.index.insert((&embedding, rowid as usize));
-        }
+        maybe_store(&state, &key, &request, &response_text, &embedding, best_match).await;
     }
 
     info!("cache miss for key {}", key);
@@ -319,6 +248,173 @@ async fn chat_completions(
         .header("x-cache", "MISS")
         .header("x-cache-policy", &state.policy_name)
         .body(response_text.into())
+        .unwrap()
+}
+
+// Serve a cached response. Streaming requests get an SSE stream.
+fn serve_hit(
+    state: &AppState,
+    request: &ChatRequest,
+    response_json: String,
+    match_kind: &str,
+    similarity: Option<f32>,
+) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("x-cache", "HIT")
+        .header("x-cache-match", match_kind)
+        .header("x-cache-policy", &state.policy_name);
+    if let Some(sim) = similarity {
+        builder = builder.header("x-cache-sim", format!("{:.6}", sim));
+    }
+    if request.stream == Some(true) {
+        match render_sse(&response_json) {
+            Some(sse) => builder
+                .header("content-type", "text/event-stream")
+                .body(sse.into())
+                .unwrap(),
+            None => builder
+                .header("content-type", "application/json")
+                .body(response_json.into())
+                .unwrap(),
+        }
+    } else {
+        builder
+            .header("content-type", "application/json")
+            .body(response_json.into())
+            .unwrap()
+    }
+}
+
+// Cache a successful upstream response and update the adaptive policy.
+async fn maybe_store(
+    state: &AppState,
+    key: &str,
+    request: &ChatRequest,
+    response_json: &str,
+    embedding: &[f32],
+    best_match: Option<(i64, f32)>,
+) {
+    let request_json = match serde_json::to_string(&canonical_json(
+        &serde_json::to_value(request).unwrap_or(Value::Null),
+    )) {
+        Ok(j) => j,
+        Err(e) => {
+            error!("Failed to serialize request: {}", e);
+            return;
+        }
+    };
+
+    let mut should_store = true;
+    if state.policy_name == "ld3" {
+        if let Some((rowid, similarity)) = best_match {
+            let cached_json = {
+                let conn = state.db.lock().await;
+                lookup_by_rowid(&conn, rowid).ok().flatten()
+            };
+            if let Some(cached_json) = cached_json {
+                if response_content(&cached_json).is_some()
+                    && response_content(response_json).is_some()
+                {
+                    let correct = judge_content_equal(&cached_json, response_json);
+                    let mut policy = state
+                        .adaptive_policy
+                        .as_ref()
+                        .expect("ld3 policy")
+                        .lock()
+                        .await;
+                    policy.observe(rowid as usize, similarity, correct);
+                    should_store = policy.should_insert();
+                }
+            }
+        }
+    }
+
+    if should_store {
+        let rowid = {
+            let conn = state.db.lock().await;
+            match store(
+                &conn,
+                key,
+                &request_json,
+                response_json,
+                &request.model,
+                embedding,
+            ) {
+                Ok(id) => id,
+                Err(e) => {
+                    error!("Failed to store response: {}", e);
+                    return;
+                }
+            }
+        };
+
+        // Insert the new embedding into the in-memory index.
+        state.index.insert((embedding, rowid as usize));
+    }
+}
+
+// Stream an upstream SSE response to the client and cache the assembled completion.
+async fn stream_and_cache(
+    state: AppState,
+    request: ChatRequest,
+    key: String,
+    embedding: Vec<f32>,
+    best_match: Option<(i64, f32)>,
+    upstream_response: reqwest::Response,
+) -> Response {
+    let policy_name = state.policy_name.clone();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(64);
+    let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let tee_buffer = buffer.clone();
+    tokio::spawn(async move {
+        let mut stream = upstream_response.bytes_stream();
+        let mut failed = false;
+        while let Some(item) = stream.next().await {
+            match &item {
+                Ok(bytes) => {
+                    let mut buf = tee_buffer.lock().await;
+                    buf.extend_from_slice(bytes);
+                }
+                Err(e) => {
+                    error!("Upstream stream error: {}", e);
+                    failed = true;
+                    break;
+                }
+            }
+            if tx.send(item).await.is_err() {
+                // The client disconnected. Do not cache.
+                return;
+            }
+        }
+        if failed {
+            return;
+        }
+        let sse_text = {
+            let buf = buffer.lock().await;
+            String::from_utf8_lossy(&buf).into_owned()
+        };
+        if let Some(assembled) = assemble_from_sse(&sse_text) {
+            maybe_store(
+                &state,
+                &key,
+                &request,
+                &assembled.to_string(),
+                &embedding,
+                best_match,
+            )
+            .await;
+        }
+    });
+
+    let stream = unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("x-cache", "MISS")
+        .header("x-cache-policy", &policy_name)
+        .body(Body::from_stream(stream))
         .unwrap()
 }
 
@@ -393,8 +489,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, add_policy_header));
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
-    info!("veritas-cache listening on 127.0.0.1:8080");
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+    info!("veritas-cache listening on 127.0.0.1:{}", port);
     axum::serve(listener, app).await?;
 
     Ok(())

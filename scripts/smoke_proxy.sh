@@ -2,8 +2,9 @@
 # Run an end-to-end smoke test of the proxy without a real API.
 set -e
 
-PROXY_URL="http://127.0.0.1:8080"
+PROXY_URL="http://127.0.0.1:18080"
 MOCK_URL="http://127.0.0.1:18099"
+PORT=18080
 WORK_DIR=$(mktemp -d)
 DB_PATH="$WORK_DIR/cache.db"
 BODY_ONE="$WORK_DIR/body_one.json"
@@ -30,6 +31,9 @@ EOF
 cat > "$BODY_TWO" <<'EOF'
 {"model":"gpt-4o-mini","messages":[{"role":"user","content":"who wrote the declaration of independence"}]}
 EOF
+cat > "$WORK_DIR/body_stream.json" <<'EOF'
+{"model":"gpt-4o-mini","messages":[{"role":"user","content":"what is the capital of france"}],"stream":true}
+EOF
 
 # Start the mock upstream.
 python3 scripts/mock_upstream.py &
@@ -37,12 +41,12 @@ MOCK_PID=$!
 sleep 1
 
 # Start the proxy against the mock upstream.
-CACHE_DB_PATH="$DB_PATH" UPSTREAM_BASE_URL="$MOCK_URL" cargo run --release --bin veritas-cache &
+CACHE_DB_PATH="$DB_PATH" PORT="$PORT" UPSTREAM_BASE_URL="$MOCK_URL" cargo run --release --bin veritas-cache &
 PROXY_PID=$!
 
-# Wait for the proxy health endpoint.
+# Wait for the proxy health endpoint to return the expected body.
 WAITED=0
-until curl -sS "$PROXY_URL/health" > /dev/null 2>&1; do
+until [ "$(curl -sS "$PROXY_URL/health" 2>/dev/null)" = "ok" ]; do
     sleep 1
     WAITED=$((WAITED + 1))
     if [ "$WAITED" -ge 60 ]; then
@@ -81,6 +85,35 @@ if grep -q "^x-cache: MISS" "$HEADERS_FILE"; then
     echo "PASS different request is a miss"
 else
     fail "different request was not a miss"
+fi
+
+# Request four: a streaming body. Expect a miss and an SSE body.
+BODY_STREAM="$WORK_DIR/body_stream.json"
+curl -sS -D "$HEADERS_FILE" -o "$WORK_DIR/stream_body.txt" -X POST \
+    -H "Content-Type: application/json" --data-binary "@$BODY_STREAM" "$PROXY_URL/v1/chat/completions"
+if grep -q "^x-cache: MISS" "$HEADERS_FILE" && grep -q "^content-type: text/event-stream" "$HEADERS_FILE"; then
+    echo "PASS streaming first request is a miss with SSE"
+else
+    fail "streaming first request was not an SSE miss"
+fi
+if tail -c 20 "$WORK_DIR/stream_body.txt" | grep -q "data: \[DONE\]"; then
+    echo "PASS streaming miss body ends with DONE"
+else
+    fail "streaming miss body did not end with DONE"
+fi
+
+# Request five: the same streaming body. Expect an exact hit with SSE.
+curl -sS -D "$HEADERS_FILE" -o "$WORK_DIR/stream_hit_body.txt" -X POST \
+    -H "Content-Type: application/json" --data-binary "@$BODY_STREAM" "$PROXY_URL/v1/chat/completions"
+if grep -q "^x-cache: HIT" "$HEADERS_FILE" && grep -q "^x-cache-match: exact" "$HEADERS_FILE" && grep -q "^content-type: text/event-stream" "$HEADERS_FILE"; then
+    echo "PASS streaming repeated request is an exact hit with SSE"
+else
+    fail "streaming repeated request was not an SSE hit"
+fi
+if tail -c 20 "$WORK_DIR/stream_hit_body.txt" | grep -q "data: \[DONE\]"; then
+    echo "PASS streaming hit body ends with DONE"
+else
+    fail "streaming hit body did not end with DONE"
 fi
 
 echo "SMOKE PASS"

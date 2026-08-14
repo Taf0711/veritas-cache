@@ -2,7 +2,7 @@ use hnsw_rs::prelude::*;
 use ort::{session::Session, value::Tensor};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
@@ -51,6 +51,221 @@ pub fn judge_content_equal(cached_json: &str, fresh_json: &str) -> bool {
     }
 }
 
+// Assemble a non-streaming chat completion from buffered OpenAI SSE text.
+// Return None when the stream is not valid OpenAI SSE.
+pub fn assemble_from_sse(sse_text: &str) -> Option<Value> {
+    let mut id: Option<String> = None;
+    let mut created: Option<i64> = None;
+    let mut model: Option<String> = None;
+    let mut role: Option<String> = None;
+    let mut content = String::new();
+    // Tool calls accumulate by index.
+    let mut tool_calls: Vec<(usize, Value)> = Vec::new();
+    let mut finish_reason: Option<String> = None;
+    let mut usage: Option<Value> = None;
+
+    for line in sse_text.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data == "[DONE]" || data.is_empty() {
+            continue;
+        }
+        let chunk: Value = serde_json::from_str(data).ok()?;
+        if id.is_none() {
+            id = chunk.get("id").and_then(Value::as_str).map(String::from);
+        }
+        if created.is_none() {
+            created = chunk.get("created").and_then(Value::as_i64);
+        }
+        if model.is_none() {
+            model = chunk.get("model").and_then(Value::as_str).map(String::from);
+        }
+        // Skip null usage fields. Intermediate chunks carry null when
+        // stream_options.include_usage is set. Only the final chunk has the object.
+        if usage.is_none() {
+            usage = chunk.get("usage").filter(|u| !u.is_null()).cloned();
+        }
+        let Some(choice) = chunk
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
+            continue;
+        };
+        if let Some(delta) = choice.get("delta") {
+            if role.is_none() {
+                role = delta.get("role").and_then(Value::as_str).map(String::from);
+            }
+            if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                content.push_str(text);
+            }
+            if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    match tool_calls.iter_mut().find(|(i, _)| *i == index) {
+                        Some((_, acc)) => merge_tool_call(acc, call),
+                        None => {
+                            let mut acc = json!({});
+                            merge_tool_call(&mut acc, call);
+                            tool_calls.push((index, acc));
+                        }
+                    }
+                }
+            }
+        }
+        if finish_reason.is_none() {
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                if !reason.is_empty() {
+                    finish_reason = Some(reason.to_string());
+                }
+            }
+        }
+    }
+
+    let mut message = serde_json::Map::new();
+    message.insert(
+        "role".to_string(),
+        Value::String(role.unwrap_or_else(|| "assistant".to_string())),
+    );
+    message.insert("content".to_string(), Value::String(content));
+    if !tool_calls.is_empty() {
+        tool_calls.sort_by_key(|(i, _)| *i);
+        let calls: Vec<Value> = tool_calls.into_iter().map(|(_, call)| call).collect();
+        message.insert("tool_calls".to_string(), Value::Array(calls));
+    }
+
+    let mut choice = serde_json::Map::new();
+    choice.insert("index".to_string(), Value::from(0));
+    choice.insert("message".to_string(), Value::Object(message));
+    choice.insert(
+        "finish_reason".to_string(),
+        Value::String(finish_reason.unwrap_or_else(|| "stop".to_string())),
+    );
+
+    let mut completion = serde_json::Map::new();
+    completion.insert("id".to_string(), Value::String(id.unwrap_or_default()));
+    completion.insert(
+        "object".to_string(),
+        Value::String("chat.completion".to_string()),
+    );
+    completion.insert(
+        "created".to_string(),
+        created.map(Value::from).unwrap_or_else(|| Value::from(0)),
+    );
+    completion.insert(
+        "model".to_string(),
+        model.unwrap_or_default().into(),
+    );
+    completion.insert("choices".to_string(), Value::Array(vec![Value::Object(choice)]));
+    if let Some(u) = usage {
+        completion.insert("usage".to_string(), u);
+    }
+    Some(Value::Object(completion))
+}
+
+// Merge one tool-call delta fragment into the accumulated call for its index.
+fn merge_tool_call(acc: &mut Value, fragment: &Value) {
+    if let Some(obj) = acc.as_object_mut() {
+        if let Some(id) = fragment.get("id").and_then(Value::as_str) {
+            obj.insert("id".to_string(), Value::String(id.to_string()));
+        }
+        if let Some(call_type) = fragment.get("type").and_then(Value::as_str) {
+            obj.insert("type".to_string(), Value::String(call_type.to_string()));
+        }
+        if let Some(func) = fragment.get("function") {
+            let entry = obj
+                .entry("function".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(fn_obj) = entry.as_object_mut() {
+                if let Some(name) = func.get("name").and_then(Value::as_str) {
+                    fn_obj.insert("name".to_string(), Value::String(name.to_string()));
+                }
+                if let Some(args) = func.get("arguments").and_then(Value::as_str) {
+                    let existing = fn_obj
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let merged = format!("{existing}{args}");
+                    fn_obj.insert("arguments".to_string(), Value::String(merged));
+                }
+            }
+        }
+    }
+}
+
+// Render a stored chat completion as OpenAI SSE text.
+// Return None when the stored JSON is not a valid completion.
+pub fn render_sse(completion_json: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(completion_json).ok()?;
+    let id = value
+        .get("id")
+        .cloned()
+        .unwrap_or_else(|| Value::String(String::new()));
+    let created = value.get("created").cloned().unwrap_or_else(|| Value::from(0));
+    let model = value
+        .get("model")
+        .cloned()
+        .unwrap_or_else(|| Value::String(String::new()));
+    let choice = value.get("choices")?.as_array()?.first()?;
+    let message = choice.get("message")?;
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("assistant")
+        .to_string();
+    let content = message
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let tool_calls = message.get("tool_calls").cloned();
+    let finish_reason = choice
+        .get("finish_reason")
+        .cloned()
+        .unwrap_or_else(|| Value::String("stop".to_string()));
+    let usage = value.get("usage").cloned();
+
+    let mut delta = serde_json::Map::new();
+    delta.insert("role".to_string(), Value::String(role));
+    delta.insert("content".to_string(), Value::String(content));
+    if let Some(calls) = tool_calls {
+        delta.insert("tool_calls".to_string(), calls);
+    }
+
+    let mut out = String::new();
+    let first = json!({
+        "id": id.clone(),
+        "object": "chat.completion.chunk",
+        "created": created.clone(),
+        "model": model.clone(),
+        "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
+    });
+    out.push_str(&format!("data: {first}\n\n"));
+    let second = json!({
+        "id": id.clone(),
+        "object": "chat.completion.chunk",
+        "created": created.clone(),
+        "model": model.clone(),
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]
+    });
+    out.push_str(&format!("data: {second}\n\n"));
+    if let Some(u) = usage {
+        let third = json!({
+            "id": id.clone(),
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": u
+        });
+        out.push_str(&format!("data: {third}\n\n"));
+    }
+    out.push_str("data: [DONE]\n\n");
+    Some(out)
+}
+
 // Embedding model and tokenizer.
 // Session::run needs mut self, so embedder access uses a Mutex.
 pub struct Embedder {
@@ -87,10 +302,17 @@ pub fn to_hex(bytes: &[u8]) -> String {
 }
 
 // Build a stable SHA-256 cache key for a chat request.
+// The stream fields do not change the response content.
+// Streaming and non-streaming variants share one cache entry.
 pub fn cache_key(request: &ChatRequest) -> Result<String, serde_json::Error> {
     let value = serde_json::to_value(request)?;
     let canonical = canonical_json(&value);
-    let json_bytes = serde_json::to_vec(&canonical)?;
+    let mut cleaned = canonical;
+    if let Some(obj) = cleaned.as_object_mut() {
+        obj.remove("stream");
+        obj.remove("stream_options");
+    }
+    let json_bytes = serde_json::to_vec(&cleaned)?;
     Ok(to_hex(&Sha256::digest(&json_bytes)))
 }
 
@@ -388,6 +610,111 @@ mod tests {
         .unwrap();
 
         assert_eq!(cache_key(&req_a).unwrap(), cache_key(&req_b).unwrap());
+    }
+
+    #[test]
+    fn cache_key_ignores_stream_fields() {
+        let streaming: ChatRequest = serde_json::from_value(json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }))
+        .unwrap();
+
+        let plain: ChatRequest = serde_json::from_value(json!({
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        assert_eq!(cache_key(&streaming).unwrap(), cache_key(&plain).unwrap());
+    }
+
+    // Build one SSE data line from a chunk value.
+    fn sse_line(chunk: Value) -> String {
+        format!("data: {}\n\n", chunk)
+    }
+
+    #[test]
+    fn assemble_from_sse_builds_completion_with_tool_calls() {
+        let mut sse = String::new();
+        let chunk = |delta: Value, finish: Option<&str>| {
+            json!({
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "created": 123,
+                "model": "gpt-4o-mini",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]
+            })
+        };
+        sse.push_str(&sse_line(chunk(
+            json!({"role": "assistant", "content": ""}),
+            None,
+        )));
+        sse.push_str(&sse_line(chunk(json!({"content": "Hello"}), None)));
+        sse.push_str(&sse_line(chunk(
+            json!({"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "run", "arguments": "{\"cmd\":"}}]}), 
+            None,
+        )));
+        sse.push_str(&sse_line(chunk(
+            json!({"tool_calls": [{"index": 0, "function": {"arguments": "\"ls\"}"}}]}), 
+            None,
+        )));
+        sse.push_str(&sse_line(chunk(json!({}), Some("tool_calls"))));
+        let usage_chunk = json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 123,
+            "model": "gpt-4o-mini",
+            "choices": [],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+        sse.push_str(&sse_line(usage_chunk));
+        sse.push_str("data: [DONE]\n\n");
+
+        let assembled = assemble_from_sse(&sse).unwrap();
+        assert_eq!(assembled["id"], "chatcmpl-1");
+        assert_eq!(assembled["model"], "gpt-4o-mini");
+        assert_eq!(assembled["created"], 123);
+        assert_eq!(assembled["object"], "chat.completion");
+        let choice = &assembled["choices"][0];
+        assert_eq!(choice["message"]["role"], "assistant");
+        assert_eq!(choice["message"]["content"], "Hello");
+        let call = &choice["message"]["tool_calls"][0];
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "run");
+        assert_eq!(call["function"]["arguments"], "{\"cmd\":\"ls\"}");
+        assert_eq!(choice["finish_reason"], "tool_calls");
+        assert_eq!(assembled["usage"]["total_tokens"], 15);
+    }
+
+    #[test]
+    fn render_sse_roundtrips_through_assemble() {
+        let completion = json!({
+            "id": "chatcmpl-9",
+            "object": "chat.completion",
+            "created": 456,
+            "model": "gpt-4o-mini",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "four"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}
+        });
+
+        let sse = render_sse(&completion.to_string()).unwrap();
+        assert!(sse.ends_with("data: [DONE]\n\n"));
+
+        let rebuilt = assemble_from_sse(&sse).unwrap();
+        assert_eq!(rebuilt["id"], "chatcmpl-9");
+        assert_eq!(rebuilt["model"], "gpt-4o-mini");
+        assert_eq!(rebuilt["created"], 456);
+        assert_eq!(rebuilt["choices"][0]["message"]["content"], "four");
+        assert_eq!(rebuilt["choices"][0]["finish_reason"], "stop");
+        assert_eq!(rebuilt["usage"]["total_tokens"], 3);
     }
 
     #[test]
