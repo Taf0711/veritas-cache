@@ -4,6 +4,7 @@
 # Every arm shares the proxy path so the arms differ in serving only.
 set -e
 
+UPSTREAM_URL="https://openrouter.ai/api"
 PORT=18090
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SUITE="$REPO_ROOT/bench/splice/suite.json"
@@ -69,7 +70,7 @@ start_proxy() {
     mkdir -p "$ARM_DIR"
     env PORT="$PORT" \
         CACHE_DB_PATH="$ARM_DIR/cache.db" \
-        UPSTREAM_BASE_URL="https://openrouter.ai/api/v1" \
+        UPSTREAM_BASE_URL="$UPSTREAM_URL" \
         "$@" "$PROXY_BIN" > "$ARM_DIR/proxy.log" 2>&1 &
     PROXY_PID=$!
     WAITED=0
@@ -94,6 +95,26 @@ if [ "$DRY_RUN" = "1" ]; then
     stop_proxy
     echo "DRY RUN OK"
     exit 0
+fi
+
+# Preflight: prove the upstream answers through the proxy before the arms run.
+# Use a throwaway database so the probe response never pollutes an arm.
+if [ "$DRY_RUN" = "0" ]; then
+    start_proxy preflight CACHE_SHADOW=1
+    cat > "$WORK_DIR/probe.json" <<EOF
+{"model":"$MODEL","messages":[{"role":"user","content":"say ok"}],"max_tokens":1}
+EOF
+    PROBE_CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
+        -H "Content-Type: application/json" -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+        --data-binary "@$WORK_DIR/probe.json" "http://127.0.0.1:$PORT/v1/chat/completions")
+    stop_proxy
+    rm -rf "$WORK_DIR/preflight"
+    if [ "$PROBE_CODE" != "200" ]; then
+        echo "FAIL upstream probe returned HTTP $PROBE_CODE"
+        echo "Check OPENROUTER_API_KEY and the model id $MODEL."
+        exit 1
+    fi
+    echo "PASS upstream probe"
 fi
 
 # Each arm runs the same suite against the same proxy port.
