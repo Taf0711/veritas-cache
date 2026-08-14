@@ -3,7 +3,8 @@
 veritas-cache is an OpenAI-compatible cache proxy. It receives requests from an OpenAI SDK client. It returns a stored response on a cache hit. It forwards the request on a cache miss.
 
 The proxy supports exact-match and semantic caching. Semantic hits use one static global
-threshold or the adaptive ld3 policy.
+threshold or the adaptive ld3 policy. Streaming and non-streaming requests share one cache
+entry.
 
 ## Requirements
 
@@ -46,6 +47,21 @@ client = OpenAI(
 )
 ```
 
+## Configuration
+
+All settings have defaults. Environment variables win over config file values.
+
+- `PORT` sets the listen port. The default is `8080`.
+- `CACHE_DB_PATH` sets the SQLite path. The default is `cache.db`.
+- `UPSTREAM_BASE_URL` sets the upstream API. The default is `https://api.openai.com`.
+- `SEMANTIC_THRESHOLD` sets the minimum cosine similarity for a semantic hit. The default is `0.85`.
+- `SEMANTIC_POLICY=ld3` selects the adaptive per-entry policy. `ADAPTIVE_DELTA` sets its error budget. The default policy is `static`.
+- `CACHE_TTL_SECONDS` expires entries older than the limit. The default `0` disables expiry.
+- `CACHE_MAX_ENTRIES` evicts the least recently used entries beyond the cap. The default `0` disables the cap.
+- `CACHE_EXACT_ONLY_MODELS` lists model names that use exact matching only. Use a comma between names.
+- `CACHE_SHADOW=1` enables shadow mode. See the shadow mode section.
+- `CACHE_CONFIG` points to a JSON file with any of these settings in snake_case keys.
+
 ## Cache behavior
 
 - The proxy checks exact request matches first.
@@ -53,9 +69,10 @@ client = OpenAI(
 - `x-cache: HIT` means the response came from the cache. `x-cache: MISS` means the proxy called the upstream API and stored the response.
 - `x-cache-match: exact` marks an exact hit. `x-cache-match: semantic` marks a semantic hit.
 - `x-cache-sim: 0.876543` shows the cosine similarity of a semantic hit.
-- `SEMANTIC_THRESHOLD` controls the minimum cosine similarity for a semantic hit. The default is `0.85`.
-- `SEMANTIC_POLICY=ld3` selects the adaptive per-entry policy. `ADAPTIVE_DELTA` sets its error
-  budget. The default policy is `static`.
+- The cache key covers the full request, including `tool_choice`. It ignores `stream` and `stream_options`.
+- Streaming requests pass chunks through live. The proxy caches the assembled completion when the stream ends. Streaming hits are served as SSE.
+- Cache hits carry synthesized usage. The prompt token count matches the new request.
+- Exact-only models skip the semantic path. They still store responses for exact reuse.
 
 ## Benchmark
 
@@ -90,10 +107,21 @@ cargo run --release --bin bench
 python3 scripts/make_charts.py
 ```
 
+## Metrics
+
+`GET /metrics` returns request counters as JSON. The counters are `hits_exact`, `hits_semantic`, `misses`, `stores`, and `evicted`. The counters reset on restart.
+
+## Shadow mode
+
+Set `CACHE_SHADOW=1` to log every decision without serving from cache. The `shadow_log` table records each decision, its similarity, the cached response, and the fresh upstream response. Use the log to judge decisions offline against real traffic.
+
 ## Status
 
-Phase 1: exact-match and semantic cache proxy with one static threshold. Done. Streaming is
-not supported yet.
+Phase 1: exact-match and semantic cache proxy with one static threshold. Done.
 Phase 2: benchmark trace, replay harness, and baseline measurements. Done.
-Phase 3: per-entry adaptive thresholds with a measured error bound. Done. The policies are
-benchmarked in the harness. The ld3 policy is wired into the proxy.
+Phase 3: per-entry adaptive thresholds with a measured error bound. Done. The ld3 policy is
+wired into the proxy.
+Phase 5: productionization. Done. SSE streaming, persisted adaptive state, TTL and LRU
+eviction, exact-only mode, metrics, and a JSON config file.
+Phase 6: real-traffic evals. In progress. Shadow mode is done. The Splice control-loop
+experiment harness is built.
