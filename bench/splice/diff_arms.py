@@ -9,6 +9,7 @@ Default run_dir: bench/splice/runs/latest
 """
 import json
 import os
+import re
 import sqlite3
 import sys
 
@@ -44,6 +45,14 @@ def load_arm(run_dir, arm):
             db_stats["hit_count_sum"] = row[1]
         conn.close()
     return report, db_stats
+
+
+def abort_reason(report):
+    """Pull the abort reason from the failure record. Empty when absent."""
+    failures = report.get("failures") or []
+    text = "\n".join(f.get("message", "") for f in failures)
+    match = re.search(r"abort_\w+: [^\n.]*", text)
+    return match.group(0) if match else ""
 
 
 def task_rows(report):
@@ -90,6 +99,9 @@ def main():
             continue
         report, db_stats = loaded
         print(f"\narm {arm}")
+        reason = abort_reason(report)
+        if reason:
+            print(f"  abort: {reason}")
         if db_stats:
             print(f"  db: {db_stats}")
         rows = task_rows(report)
