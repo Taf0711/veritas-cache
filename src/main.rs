@@ -443,7 +443,7 @@ async fn stream_and_cache(
 ) -> Response {
     let policy_name = state.policy_name.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, reqwest::Error>>(64);
-    let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let buffer: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     let tee_buffer = buffer.clone();
     tokio::spawn(async move {
@@ -452,7 +452,7 @@ async fn stream_and_cache(
         while let Some(item) = stream.next().await {
             match &item {
                 Ok(bytes) => {
-                    let mut buf = tee_buffer.lock().await;
+                    let mut buf = tee_buffer.lock().unwrap();
                     buf.extend_from_slice(bytes);
                 }
                 Err(e) => {
@@ -470,7 +470,7 @@ async fn stream_and_cache(
             return;
         }
         let sse_text = {
-            let buf = buffer.lock().await;
+            let buf = buffer.lock().unwrap();
             String::from_utf8_lossy(&buf).into_owned()
         };
         if let Some(assembled) = assemble_from_sse(&sse_text) {
