@@ -178,12 +178,16 @@ for BODY in "$WORK_DIR/body_forced.json" "$WORK_DIR/body_auto.json"; do
     fi
 done
 
-# Restart once more. The database now holds exact-only entries without embeddings.
+# Restart once more, configured by a JSON file instead of env vars.
+# The database now holds exact-only entries without embeddings.
 # The boot index rebuild must skip them and serve their exact hits.
+cat > "$WORK_DIR/config.json" <<EOF
+{"port": "$PORT", "exact_only_models": ["gpt-4o-mini"]}
+EOF
 kill "$PROXY_PID" 2>/dev/null || true
 wait "$PROXY_PID" 2>/dev/null || true
-CACHE_DB_PATH="$DB_PATH" PORT="$PORT" UPSTREAM_BASE_URL="$MOCK_URL" \
-    CACHE_EXACT_ONLY_MODELS="gpt-4o-mini" cargo run --release --bin veritas-cache &
+CACHE_DB_PATH="$DB_PATH" UPSTREAM_BASE_URL="$MOCK_URL" \
+    CACHE_CONFIG="$WORK_DIR/config.json" cargo run --release --bin veritas-cache &
 PROXY_PID=$!
 WAITED=0
 until [ "$(curl -sS "$PROXY_URL/health" 2>/dev/null)" = "ok" ]; do
@@ -200,6 +204,19 @@ if grep -q "^x-cache: HIT" "$HEADERS_FILE" && grep -q "^x-cache-match: exact" "$
     echo "PASS boot over exact-only entries serves their exact hits"
 else
     fail "boot over exact-only entries did not serve an exact hit"
+fi
+
+# The metrics endpoint reports counters for this process.
+# This restart served one exact hit and no misses.
+curl -sS "$PROXY_URL/metrics" -o "$WORK_DIR/metrics.json"
+if grep -q '"hits_exact":1' "$WORK_DIR/metrics.json" \
+    && grep -q '"misses":0' "$WORK_DIR/metrics.json" \
+    && grep -q '"hits_semantic":0' "$WORK_DIR/metrics.json" \
+    && grep -q '"stores":0' "$WORK_DIR/metrics.json" \
+    && grep -q '"evicted":0' "$WORK_DIR/metrics.json"; then
+    echo "PASS metrics endpoint reports the counters of this process"
+else
+    fail "metrics endpoint did not report the expected counters"
 fi
 
 echo "SMOKE PASS"

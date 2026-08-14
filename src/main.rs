@@ -12,7 +12,8 @@ use futures_util::StreamExt;
 use hnsw_rs::prelude::*;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use rusqlite::Connection;
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info};
@@ -21,11 +22,24 @@ use veritas_cache::policy::{Decision, Policy};
 use veritas_cache::{
     assemble_from_sse, build_embedder, build_index, cache_key, canonical_json, count_tokens,
     embed, evict, increment_hits, increment_hits_by_rowid, init_db, insert_observation,
-    judge_content_equal, load_observations, lookup,
+    judge_content_equal, load_file_config, load_observations, lookup,
     lookup_by_rowid, model_by_rowid, parse_exact_only_models, prompt_text, render_sse,
     response_content, semantic_hit, store, synthesize_usage, unix_now, ChatRequest, Embedder,
     ErrorResponse,
 };
+
+// Report the runtime counters as JSON.
+async fn get_metrics(State(state): State<AppState>) -> Response {
+    let m = &state.metrics;
+    Json(json!({
+        "hits_exact": m.hits_exact.load(Ordering::Relaxed),
+        "hits_semantic": m.hits_semantic.load(Ordering::Relaxed),
+        "misses": m.misses.load(Ordering::Relaxed),
+        "stores": m.stores.load(Ordering::Relaxed),
+        "evicted": m.evicted.load(Ordering::Relaxed),
+    }))
+    .into_response()
+}
 
 // Return a simple health check response.
 async fn health() -> &'static str {
@@ -45,6 +59,16 @@ async fn add_policy_header(
 }
 
 // The application state contains the database, the HTTP client, the embedder and the ANN index.
+// Runtime counters for the metrics endpoint.
+#[derive(Default)]
+struct Metrics {
+    hits_exact: AtomicU64,
+    hits_semantic: AtomicU64,
+    misses: AtomicU64,
+    stores: AtomicU64,
+    evicted: AtomicU64,
+}
+
 #[derive(Clone)]
 struct AppState {
     db: Arc<Mutex<Connection>>,
@@ -58,6 +82,7 @@ struct AppState {
     ttl_seconds: i64,
     max_entries: i64,
     exact_only_models: std::collections::HashSet<String>,
+    metrics: Arc<Metrics>,
 }
 
 // Handle POST /v1/chat/completions: exact match, semantic match, or upstream proxy.
@@ -108,6 +133,7 @@ async fn chat_completions(
             error!("Failed to update hit count: {}", e);
         }
         info!("cache exact hit for key {}", key);
+        state.metrics.hits_exact.fetch_add(1, Ordering::Relaxed);
         return serve_hit(&state, &request, response_json, "exact", None).await;
     }
 
@@ -207,11 +233,13 @@ async fn chat_completions(
                 "cache semantic hit for key {} with similarity {}",
                 key, similarity
             );
+            state.metrics.hits_semantic.fetch_add(1, Ordering::Relaxed);
             return serve_hit(&state, &request, response_json, "semantic", Some(similarity)).await;
         }
     }
 
     // Forward the original body to the upstream LLM API.
+    state.metrics.misses.fetch_add(1, Ordering::Relaxed);
     let url = format!("{}/v1/chat/completions", state.upstream_base);
     let mut upstream_request = state
         .client
@@ -386,11 +414,18 @@ async fn maybe_store(
         if !embedding.is_empty() {
             state.index.insert((embedding, rowid as usize));
         }
+        state.metrics.stores.fetch_add(1, Ordering::Relaxed);
 
         // Evict expired and excess entries after each store.
         let conn = state.db.lock().await;
         match evict(&conn, state.ttl_seconds, state.max_entries, unix_now()) {
-            Ok(deleted) if deleted > 0 => info!("evicted {} cache entries", deleted),
+            Ok(deleted) if deleted > 0 => {
+                state
+                    .metrics
+                    .evicted
+                    .fetch_add(deleted as u64, Ordering::Relaxed);
+                info!("evicted {} cache entries", deleted);
+            }
             Ok(_) => {}
             Err(e) => error!("Failed to evict entries: {}", e),
         }
@@ -471,29 +506,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
-    let db_path = std::env::var("CACHE_DB_PATH").unwrap_or_else(|_| "cache.db".to_string());
+    let file_config = load_file_config().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+
+    let db_path = std::env::var("CACHE_DB_PATH")
+        .ok()
+        .or(file_config.db_path)
+        .unwrap_or_else(|| "cache.db".to_string());
     let conn = Connection::open(&db_path)?;
     init_db(&conn)?;
     let db = Arc::new(Mutex::new(conn));
 
-    let upstream_base =
-        std::env::var("UPSTREAM_BASE_URL").unwrap_or_else(|_| "https://api.openai.com".to_string());
+    let upstream_base = std::env::var("UPSTREAM_BASE_URL")
+        .ok()
+        .or(file_config.upstream_base_url)
+        .unwrap_or_else(|| "https://api.openai.com".to_string());
 
     let semantic_threshold = std::env::var("SEMANTIC_THRESHOLD")
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
+        .or(file_config.semantic_threshold)
         .unwrap_or(0.85);
-    let policy_name = std::env::var("SEMANTIC_POLICY").unwrap_or_else(|_| "static".to_string());
+    let policy_name = std::env::var("SEMANTIC_POLICY")
+        .ok()
+        .or(file_config.semantic_policy)
+        .unwrap_or_else(|| "static".to_string());
     let ttl_seconds = std::env::var("CACHE_TTL_SECONDS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
+        .or(file_config.ttl_seconds)
         .unwrap_or(0);
     let max_entries = std::env::var("CACHE_MAX_ENTRIES")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
+        .or(file_config.max_entries)
         .unwrap_or(0);
-    let exact_only_models =
-        parse_exact_only_models(&std::env::var("CACHE_EXACT_ONLY_MODELS").unwrap_or_default());
+    let exact_only_models = match std::env::var("CACHE_EXACT_ONLY_MODELS") {
+        Ok(v) => parse_exact_only_models(&v),
+        Err(_) => file_config
+            .exact_only_models
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+    };
     let adaptive_policy = match policy_name.as_str() {
         "static" => None,
         "ld3" => {
@@ -541,11 +595,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("replayed {} adaptive observations", count);
     }
 
+    let metrics = Arc::new(Metrics::default());
+
     // Evict entries that already exceed the limits before serving traffic.
     {
         let conn = db.lock().await;
         match evict(&conn, ttl_seconds, max_entries, unix_now()) {
-            Ok(deleted) if deleted > 0 => info!("evicted {} cache entries at boot", deleted),
+            Ok(deleted) if deleted > 0 => {
+                metrics.evicted.fetch_add(deleted as u64, Ordering::Relaxed);
+                info!("evicted {} cache entries at boot", deleted);
+            }
             Ok(_) => {}
             Err(e) => error!("Failed to evict entries at boot: {}", e),
         }
@@ -563,15 +622,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ttl_seconds,
         max_entries,
         exact_only_models,
+        metrics,
     };
 
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/health", get(health))
+        .route("/metrics", get(get_metrics))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, add_policy_header));
 
-    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let port = std::env::var("PORT")
+        .ok()
+        .or(file_config.port)
+        .unwrap_or_else(|| "8080".to_string());
     let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     info!("veritas-cache listening on 127.0.0.1:{}", port);
     axum::serve(listener, app).await?;

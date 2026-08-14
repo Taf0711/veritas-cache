@@ -374,6 +374,36 @@ pub fn parse_exact_only_models(value: &str) -> std::collections::HashSet<String>
         .collect()
 }
 
+// Optional JSON config file. Every key is optional.
+// Environment variables win over these values.
+#[derive(Debug, Default, Deserialize)]
+pub struct FileConfig {
+    pub port: Option<String>,
+    pub db_path: Option<String>,
+    pub upstream_base_url: Option<String>,
+    pub semantic_policy: Option<String>,
+    pub semantic_threshold: Option<f32>,
+    pub ttl_seconds: Option<i64>,
+    pub max_entries: Option<i64>,
+    pub exact_only_models: Option<Vec<String>>,
+}
+
+// Parse the JSON text of a config file.
+pub fn parse_file_config(text: &str) -> Result<FileConfig, String> {
+    serde_json::from_str(text).map_err(|e| format!("Invalid config JSON: {}", e))
+}
+
+// Load the config file named by CACHE_CONFIG. Return defaults when unset.
+pub fn load_file_config() -> Result<FileConfig, String> {
+    let Ok(path) = std::env::var("CACHE_CONFIG") else {
+        return Ok(FileConfig::default());
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read CACHE_CONFIG file {}: {}", path, e))?;
+    parse_file_config(&text)
+        .map_err(|e| format!("Failed to parse CACHE_CONFIG file {}: {}", path, e))
+}
+
 // Rewrite the usage of a cached response for a new request.
 // Prompt tokens come from the new request. Completion tokens stay from the stored response.
 // Return the input unchanged when the response has no usage object.
@@ -759,6 +789,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(cache_key(&req_a).unwrap(), cache_key(&req_b).unwrap());
+    }
+
+    #[test]
+    fn parse_file_config_reads_full_and_partial_json() {
+        let full = parse_file_config(
+            r#"{"port": "18080", "db_path": "x.db", "upstream_base_url": "http://u",
+                "semantic_policy": "ld3", "semantic_threshold": 0.9, "ttl_seconds": 60,
+                "max_entries": 100, "exact_only_models": ["gpt-4o-mini"]}"#,
+        )
+        .unwrap();
+        assert_eq!(full.port.as_deref(), Some("18080"));
+        assert_eq!(full.db_path.as_deref(), Some("x.db"));
+        assert_eq!(full.upstream_base_url.as_deref(), Some("http://u"));
+        assert_eq!(full.semantic_policy.as_deref(), Some("ld3"));
+        assert_eq!(full.semantic_threshold, Some(0.9));
+        assert_eq!(full.ttl_seconds, Some(60));
+        assert_eq!(full.max_entries, Some(100));
+        assert_eq!(full.exact_only_models.as_ref().unwrap().len(), 1);
+
+        let partial = parse_file_config(r#"{"port": "18081"}"#).unwrap();
+        assert_eq!(partial.port.as_deref(), Some("18081"));
+        assert!(partial.semantic_policy.is_none());
+
+        assert!(parse_file_config("not json").is_err());
     }
 
     #[test]
