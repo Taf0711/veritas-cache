@@ -386,6 +386,7 @@ pub struct FileConfig {
     pub ttl_seconds: Option<i64>,
     pub max_entries: Option<i64>,
     pub exact_only_models: Option<Vec<String>>,
+    pub shadow: Option<bool>,
 }
 
 // Parse the JSON text of a config file.
@@ -573,6 +574,19 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
         )",
         [],
     )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS shadow_log (
+            id INTEGER PRIMARY KEY,
+            ts INTEGER NOT NULL,
+            key_hash TEXT NOT NULL,
+            model TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            similarity REAL,
+            would_serve_json TEXT,
+            fresh_json TEXT
+        )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -641,6 +655,34 @@ pub fn load_observations(conn: &Connection) -> rusqlite::Result<Vec<(i64, f32, b
         out.push((row.get(0)?, row.get(1)?, correct != 0));
     }
     Ok(out)
+}
+
+// Record one shadow-mode decision. Return the row id.
+// The fresh response lands later through set_shadow_fresh.
+pub fn insert_shadow_row(
+    conn: &Connection,
+    key_hash: &str,
+    model: &str,
+    decision: &str,
+    similarity: Option<f32>,
+    would_serve_json: Option<&str>,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO shadow_log
+         (ts, key_hash, model, decision, similarity, would_serve_json, fresh_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+        params![unix_now(), key_hash, model, decision, similarity, would_serve_json],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+// Attach the fresh upstream response to a shadow row.
+pub fn set_shadow_fresh(conn: &Connection, id: i64, fresh_json: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE shadow_log SET fresh_json = ?2 WHERE id = ?1",
+        params![id, fresh_json],
+    )?;
+    Ok(())
 }
 
 // Store a request, its response, the model and the embedding in the cache.
@@ -1018,6 +1060,53 @@ mod tests {
             .unwrap();
         let count: i64 = stmt.query_row([&key], |row| row.get(0)).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn shadow_row_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let id = insert_shadow_row(&conn, "key-a", "mock", "exact_hit", None, Some("{\"old\":1}"))
+            .unwrap();
+        set_shadow_fresh(&conn, id, "{\"new\":2}").unwrap();
+
+        let row: (i64, String, String, String, Option<f32>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT ts, key_hash, model, decision, similarity, would_serve_json, fresh_json
+                 FROM shadow_log WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(row.0 > 0);
+        assert_eq!(row.1, "key-a");
+        assert_eq!(row.2, "mock");
+        assert_eq!(row.3, "exact_hit");
+        assert_eq!(row.4, None);
+        assert_eq!(row.5.as_deref(), Some("{\"old\":1}"));
+        assert_eq!(row.6.as_deref(), Some("{\"new\":2}"));
+
+        // A miss row carries a similarity when a neighbor was rejected.
+        let id2 = insert_shadow_row(&conn, "key-b", "mock", "miss", Some(0.5), None).unwrap();
+        let sim: Option<f32> = conn
+            .query_row(
+                "SELECT similarity FROM shadow_log WHERE id = ?1",
+                [id2],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sim, Some(0.5));
     }
 
     #[test]

@@ -23,6 +23,7 @@ use veritas_cache::{
     assemble_from_sse, build_embedder, build_index, cache_key, canonical_json, count_tokens,
     embed, evict, increment_hits, increment_hits_by_rowid, init_db, insert_observation,
     judge_content_equal, load_file_config, load_observations, lookup,
+    insert_shadow_row, set_shadow_fresh,
     lookup_by_rowid, model_by_rowid, parse_exact_only_models, prompt_text, render_sse,
     response_content, semantic_hit, store, synthesize_usage, unix_now, ChatRequest, Embedder,
     ErrorResponse,
@@ -83,6 +84,27 @@ struct AppState {
     max_entries: i64,
     exact_only_models: std::collections::HashSet<String>,
     metrics: Arc<Metrics>,
+    shadow: bool,
+}
+
+// Log one shadow-mode decision and return its row id.
+async fn log_shadow(
+    state: &AppState,
+    key: &str,
+    model: &str,
+    decision: &str,
+    similarity: Option<f32>,
+    would_serve_json: Option<&str>,
+) -> Option<i64> {
+    info!("shadow decision={} key={} sim={:?}", decision, key, similarity);
+    let conn = state.db.lock().await;
+    match insert_shadow_row(&conn, key, model, decision, similarity, would_serve_json) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            error!("Failed to log shadow decision: {}", e);
+            None
+        }
+    }
 }
 
 // Handle POST /v1/chat/completions: exact match, semantic match, or upstream proxy.
@@ -125,20 +147,36 @@ async fn chat_completions(
         }
     };
 
+    // In shadow mode each request logs its decision here.
+    let mut shadow_row_id: Option<i64> = None;
+
     if let Some(response_json) = cached {
-        if let Err(e) = {
-            let conn = state.db.lock().await;
-            increment_hits(&conn, &key)
-        } {
-            error!("Failed to update hit count: {}", e);
+        if state.shadow {
+            shadow_row_id = log_shadow(
+                &state,
+                &key,
+                &request.model,
+                "exact_hit",
+                None,
+                Some(&response_json),
+            )
+            .await;
+        } else {
+            if let Err(e) = {
+                let conn = state.db.lock().await;
+                increment_hits(&conn, &key)
+            } {
+                error!("Failed to update hit count: {}", e);
+            }
+            info!("cache exact hit for key {}", key);
+            state.metrics.hits_exact.fetch_add(1, Ordering::Relaxed);
+            return serve_hit(&state, &request, response_json, "exact", None).await;
         }
-        info!("cache exact hit for key {}", key);
-        state.metrics.hits_exact.fetch_add(1, Ordering::Relaxed);
-        return serve_hit(&state, &request, response_json, "exact", None).await;
     }
 
     // Exact-only models skip the semantic path. They still store for exact reuse.
-    let exact_only = state.exact_only_models.contains(&request.model);
+    // A logged shadow exact hit also skips it. Live mode would not run it either.
+    let exact_only = state.exact_only_models.contains(&request.model) || shadow_row_id.is_some();
 
     // Embed the request prompt.
     let embedding = if exact_only {
@@ -222,20 +260,46 @@ async fn chat_completions(
                 }
             };
 
-            if let Err(e) = {
-                let conn = state.db.lock().await;
-                increment_hits_by_rowid(&conn, rowid)
-            } {
-                error!("Failed to update semantic hit count: {}", e);
-            }
+            if state.shadow {
+                shadow_row_id = log_shadow(
+                    &state,
+                    &key,
+                    &request.model,
+                    "semantic_hit",
+                    Some(similarity),
+                    Some(&response_json),
+                )
+                .await;
+            } else {
+                if let Err(e) = {
+                    let conn = state.db.lock().await;
+                    increment_hits_by_rowid(&conn, rowid)
+                } {
+                    error!("Failed to update semantic hit count: {}", e);
+                }
 
-            info!(
-                "cache semantic hit for key {} with similarity {}",
-                key, similarity
-            );
-            state.metrics.hits_semantic.fetch_add(1, Ordering::Relaxed);
-            return serve_hit(&state, &request, response_json, "semantic", Some(similarity)).await;
+                info!(
+                    "cache semantic hit for key {} with similarity {}",
+                    key, similarity
+                );
+                state.metrics.hits_semantic.fetch_add(1, Ordering::Relaxed);
+                return serve_hit(&state, &request, response_json, "semantic", Some(similarity))
+                    .await;
+            }
         }
+    }
+
+    // Log a shadow miss. Keep the neighbor similarity when one was rejected.
+    if state.shadow && shadow_row_id.is_none() {
+        shadow_row_id = log_shadow(
+            &state,
+            &key,
+            &request.model,
+            "miss",
+            best_match.map(|(_, similarity)| similarity),
+            None,
+        )
+        .await;
     }
 
     // Forward the original body to the upstream LLM API.
@@ -266,8 +330,16 @@ async fn chat_completions(
 
     // A streaming miss passes the upstream body through and caches on completion.
     if status.is_success() && streaming {
-        return stream_and_cache(state, request, key, embedding, best_match, upstream_response)
-            .await;
+        return stream_and_cache(
+            state,
+            request,
+            key,
+            embedding,
+            best_match,
+            shadow_row_id,
+            upstream_response,
+        )
+        .await;
     }
 
     let response_text = match upstream_response.text().await {
@@ -280,7 +352,16 @@ async fn chat_completions(
 
     // Cache successful upstream responses only.
     if status.is_success() {
-        maybe_store(&state, &key, &request, &response_text, &embedding, best_match).await;
+        maybe_store(
+            &state,
+            &key,
+            &request,
+            &response_text,
+            &embedding,
+            best_match,
+            shadow_row_id,
+        )
+        .await;
     }
 
     info!("cache miss for key {}", key);
@@ -341,6 +422,8 @@ async fn serve_hit(
 }
 
 // Cache a successful upstream response and update the adaptive policy.
+// Cache a successful upstream response and update the adaptive policy.
+// Attach the fresh response to the shadow row when shadow mode logged one.
 async fn maybe_store(
     state: &AppState,
     key: &str,
@@ -348,7 +431,14 @@ async fn maybe_store(
     response_json: &str,
     embedding: &[f32],
     best_match: Option<(i64, f32)>,
+    shadow_row_id: Option<i64>,
 ) {
+    if let Some(id) = shadow_row_id {
+        let conn = state.db.lock().await;
+        if let Err(e) = set_shadow_fresh(&conn, id, response_json) {
+            error!("Failed to set shadow fresh response: {}", e);
+        }
+    }
     let request_json = match serde_json::to_string(&canonical_json(
         &serde_json::to_value(request).unwrap_or(Value::Null),
     )) {
@@ -439,6 +529,7 @@ async fn stream_and_cache(
     key: String,
     embedding: Vec<f32>,
     best_match: Option<(i64, f32)>,
+    shadow_row_id: Option<i64>,
     upstream_response: reqwest::Response,
 ) -> Response {
     let policy_name = state.policy_name.clone();
@@ -481,6 +572,7 @@ async fn stream_and_cache(
                 &assembled.to_string(),
                 &embedding,
                 best_match,
+                shadow_row_id,
             )
             .await;
         }
@@ -547,6 +639,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .unwrap_or_default()
             .into_iter()
             .collect(),
+    };
+    let shadow = match std::env::var("CACHE_SHADOW") {
+        Ok(v) => v == "1",
+        Err(_) => file_config.shadow.unwrap_or(false),
     };
     let adaptive_policy = match policy_name.as_str() {
         "static" => None,
@@ -623,6 +719,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         max_entries,
         exact_only_models,
         metrics,
+        shadow,
     };
 
     let app = Router::new()

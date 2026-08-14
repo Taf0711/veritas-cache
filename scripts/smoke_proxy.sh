@@ -219,4 +219,59 @@ else
     fail "metrics endpoint did not report the expected counters"
 fi
 
+# Shadow mode: restart with CACHE_SHADOW=1.
+# The proxy must log each decision and never serve from cache.
+kill "$PROXY_PID" 2>/dev/null || true
+wait "$PROXY_PID" 2>/dev/null || true
+CACHE_DB_PATH="$DB_PATH" PORT="$PORT" UPSTREAM_BASE_URL="$MOCK_URL" \
+    CACHE_SHADOW=1 cargo run --release --bin veritas-cache &
+PROXY_PID=$!
+WAITED=0
+until [ "$(curl -sS "$PROXY_URL/health" 2>/dev/null)" = "ok" ]; do
+    sleep 1
+    WAITED=$((WAITED + 1))
+    if [ "$WAITED" -ge 60 ]; then
+        echo "FAIL proxy did not become ready after the shadow restart"
+        exit 1
+    fi
+done
+
+cat > "$WORK_DIR/body_shadow.json" <<'EOF'
+{"model":"gpt-4o-mini","messages":[{"role":"user","content":"shadow mode probe body"}]}
+EOF
+curl -sS -D "$HEADERS_FILE" -o /dev/null -X POST \
+    -H "Content-Type: application/json" --data-binary "@$WORK_DIR/body_shadow.json" "$PROXY_URL/v1/chat/completions"
+if grep -q "^x-cache: MISS" "$HEADERS_FILE"; then
+    echo "PASS shadow first request is a miss"
+else
+    fail "shadow first request was not a miss"
+fi
+curl -sS -D "$HEADERS_FILE" -o /dev/null -X POST \
+    -H "Content-Type: application/json" --data-binary "@$WORK_DIR/body_shadow.json" "$PROXY_URL/v1/chat/completions"
+if grep -q "^x-cache: MISS" "$HEADERS_FILE"; then
+    echo "PASS shadow repeated request is still a miss"
+else
+    fail "shadow repeated request was served from cache"
+fi
+
+ROWS=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM shadow_log;")
+if [ "$ROWS" = "2" ]; then
+    echo "PASS shadow log holds two rows"
+else
+    fail "shadow log holds $ROWS rows, expected 2"
+fi
+D1=$(sqlite3 "$DB_PATH" "SELECT decision FROM shadow_log ORDER BY id LIMIT 1;")
+D2=$(sqlite3 "$DB_PATH" "SELECT decision FROM shadow_log ORDER BY id DESC LIMIT 1;")
+if [ "$D1" = "miss" ] && [ "$D2" = "exact_hit" ]; then
+    echo "PASS shadow decisions are miss then exact_hit"
+else
+    fail "shadow decisions were $D1 then $D2"
+fi
+FRESH=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM shadow_log WHERE fresh_json IS NOT NULL AND fresh_json != '';")
+if [ "$FRESH" = "2" ]; then
+    echo "PASS shadow rows carry the fresh responses"
+else
+    fail "shadow rows missing fresh responses: $FRESH of 2"
+fi
+
 echo "SMOKE PASS"
