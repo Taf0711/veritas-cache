@@ -69,9 +69,11 @@ fail() {
     exit 1
 }
 
-# Request one: a fresh body. Expect a miss.
+# Request one: a fresh body with a dummy API key. Expect a miss.
+# The proxy must ignore inbound auth and pass the key through.
 curl -sS -D "$HEADERS_FILE" -o /dev/null -X POST \
-    -H "Content-Type: application/json" --data-binary "@$BODY_ONE" "$PROXY_URL/v1/chat/completions"
+    -H "Content-Type: application/json" -H "Authorization: Bearer dummy" \
+    --data-binary "@$BODY_ONE" "$PROXY_URL/v1/chat/completions"
 if grep -q "^x-cache: MISS" "$HEADERS_FILE"; then
     echo "PASS first request is a miss"
 else
