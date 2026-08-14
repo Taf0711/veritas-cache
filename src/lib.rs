@@ -469,6 +469,14 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
         )",
         [],
     )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS observations (
+            entry_rowid INTEGER NOT NULL,
+            similarity REAL NOT NULL,
+            correct INTEGER NOT NULL
+        )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -509,6 +517,34 @@ pub fn increment_hits_by_rowid(conn: &Connection, rowid: i64) -> rusqlite::Resul
         [rowid],
     )?;
     Ok(())
+}
+
+// Append one adaptive-policy observation for a cache entry.
+pub fn insert_observation(
+    conn: &Connection,
+    entry_rowid: i64,
+    similarity: f32,
+    correct: bool,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO observations (entry_rowid, similarity, correct) VALUES (?1, ?2, ?3)",
+        params![entry_rowid, similarity, correct as i64],
+    )?;
+    Ok(())
+}
+
+// Load every observation in write order for a boot-time policy replay.
+pub fn load_observations(conn: &Connection) -> rusqlite::Result<Vec<(i64, f32, bool)>> {
+    let mut stmt = conn.prepare(
+        "SELECT entry_rowid, similarity, correct FROM observations ORDER BY rowid",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let correct: i64 = row.get(2)?;
+        out.push((row.get(0)?, row.get(1)?, correct != 0));
+    }
+    Ok(out)
 }
 
 // Store a request, its response, the model and the embedding in the cache.
@@ -756,6 +792,31 @@ mod tests {
             .unwrap();
         let count: i64 = stmt.query_row([&key], |row| row.get(0)).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn observations_roundtrip_in_write_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        insert_observation(&conn, 7, 0.91, true).unwrap();
+        insert_observation(&conn, 7, 0.72, false).unwrap();
+        insert_observation(&conn, 11, 0.88, true).unwrap();
+
+        let rows = load_observations(&conn).unwrap();
+        assert_eq!(rows.len(), 3);
+
+        let for_seven: Vec<&(i64, f32, bool)> = rows.iter().filter(|r| r.0 == 7).collect();
+        assert_eq!(for_seven.len(), 2);
+        assert!((for_seven[0].1 - 0.91).abs() < 1e-6);
+        assert!(for_seven[0].2);
+        assert!((for_seven[1].1 - 0.72).abs() < 1e-6);
+        assert!(!for_seven[1].2);
+
+        let for_eleven: Vec<&(i64, f32, bool)> = rows.iter().filter(|r| r.0 == 11).collect();
+        assert_eq!(for_eleven.len(), 1);
+        assert!((for_eleven[0].1 - 0.88).abs() < 1e-6);
+        assert!(for_eleven[0].2);
     }
 
     #[test]

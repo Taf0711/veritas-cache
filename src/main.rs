@@ -20,7 +20,8 @@ use veritas_cache::adaptive::Ld3Policy;
 use veritas_cache::policy::{Decision, Policy};
 use veritas_cache::{
     assemble_from_sse, build_embedder, build_index, cache_key, canonical_json, embed,
-    increment_hits, increment_hits_by_rowid, init_db, judge_content_equal, lookup,
+    increment_hits, increment_hits_by_rowid, init_db, insert_observation, judge_content_equal,
+    load_observations, lookup,
     lookup_by_rowid, model_by_rowid, prompt_text, render_sse, response_content, semantic_hit,
     store, ChatRequest, Embedder, ErrorResponse,
 };
@@ -317,14 +318,21 @@ async fn maybe_store(
                     && response_content(response_json).is_some()
                 {
                     let correct = judge_content_equal(&cached_json, response_json);
-                    let mut policy = state
-                        .adaptive_policy
-                        .as_ref()
-                        .expect("ld3 policy")
-                        .lock()
-                        .await;
-                    policy.observe(rowid as usize, similarity, correct);
-                    should_store = policy.should_insert();
+                    {
+                        let mut policy = state
+                            .adaptive_policy
+                            .as_ref()
+                            .expect("ld3 policy")
+                            .lock()
+                            .await;
+                        policy.observe(rowid as usize, similarity, correct);
+                        should_store = policy.should_insert();
+                    }
+                    // Persist the observation so the policy survives a restart.
+                    let conn = state.db.lock().await;
+                    if let Err(e) = insert_observation(&conn, rowid, similarity, correct) {
+                        error!("Failed to store observation: {}", e);
+                    }
                 }
             }
         }
@@ -453,7 +461,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if !(0.0..=1.0).contains(&delta) {
                 return Err("ADAPTIVE_DELTA must be between 0 and 1".into());
             }
-            // In-memory state resets on restart. Entries start cold.
+            // Observations replay from the database after the index build.
             Some(Arc::new(Mutex::new(Ld3Policy::new(delta))))
         }
         other => return Err(format!("Unknown SEMANTIC_POLICY: {other}. Use static or ld3").into()),
@@ -471,6 +479,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         build_index(&conn)?
     };
     let index = Arc::new(index);
+
+    // Replay stored observations so an adaptive policy keeps its learned state.
+    // Each observe refits from the full per-entry vector. The replay order is the
+    // write order, so the final state matches a fresh in-memory run.
+    if let Some(policy) = &adaptive_policy {
+        let observations = {
+            let conn = db.lock().await;
+            load_observations(&conn)?
+        };
+        let count = observations.len();
+        let mut policy = policy.lock().await;
+        for (entry_rowid, similarity, correct) in observations {
+            policy.observe(entry_rowid as usize, similarity, correct);
+        }
+        info!("replayed {} adaptive observations", count);
+    }
 
     let state = AppState {
         db,
