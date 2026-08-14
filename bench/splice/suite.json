@@ -67,6 +67,56 @@
           ]
         }
       ]
+    },
+    {
+      "id": "add-double-helper",
+      "name": "Add a double helper",
+      "description": "Passable task. Adds one function. Measures functionality and token cost per arm.",
+      "tags": [
+        "functionality"
+      ],
+      "difficulty": "easy",
+      "prompt": "Update math_helpers.py. Add a function double(x) that returns x * 2. Keep the existing code unchanged. Do not add any other files.",
+      "workspaceFixture": "fixtures/task3",
+      "expectedChangedFiles": [
+        "math_helpers.py"
+      ],
+      "verificationCommands": [
+        {
+          "id": "double-works",
+          "name": "double returns twice the input",
+          "command": [
+            "python3",
+            "-c",
+            "from math_helpers import double; assert double(4) == 8"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "fix-first-word",
+      "name": "Fix first_word on empty input",
+      "description": "Passable task. Fixes one crash. Measures functionality and token cost per arm.",
+      "tags": [
+        "functionality"
+      ],
+      "difficulty": "easy",
+      "prompt": "Update text_utils.py. The function first_word crashes on an empty string. Make it return an empty string for empty input. Keep every other behavior unchanged. Do not add any other files.",
+      "workspaceFixture": "fixtures/task4",
+      "expectedChangedFiles": [
+        "text_utils.py"
+      ],
+      "verificationCommands": [
+        {
+          "id": "first-word-works",
+          "name": "first_word handles empty input",
+          "command": [
+            "python3",
+            "-c",
+            "from text_utils import first_word; assert first_word('hi there') == 'hi' and first_word('') == ''"
+          ]
+        }
+      ]
     }
   ]
 }

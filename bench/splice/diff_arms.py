@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Compare the three arms of the Phase 6.3 control-loop experiment.
+"""Compare the arms of the Phase 6.3 control-loop experiment.
 
 Read each arm report and cache database. Print a compact table per task.
 Signal: iteration counts, escalation events, abort status and reason.
+Cost signal: splice-reported tokens and proxy-observed upstream tokens.
+Functionality signal: pass and fail counts across the tasks.
 
 Usage: diff_arms.py [run_dir]
 Default run_dir: bench/splice/runs/latest
@@ -13,7 +15,7 @@ import re
 import sqlite3
 import sys
 
-ARMS = ["baseline", "static", "ld3"]
+ARMS = ["baseline", "exact", "static", "ld3"]
 
 
 def load_arm(run_dir, arm):
@@ -26,25 +28,55 @@ def load_arm(run_dir, arm):
         report = json.load(handle)
     db_path = os.path.join(arm_dir, "cache.db")
     db_stats = {}
+    upstream_prompt = 0
+    upstream_completion = 0
     if os.path.exists(db_path):
         conn = sqlite3.connect(db_path)
         tables = {
             row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
+        shadow_rows = 0
         if "shadow_log" in tables:
             db_stats["shadow_decisions"] = dict(
                 conn.execute(
                     "SELECT decision, COUNT(*) FROM shadow_log GROUP BY decision"
                 ).fetchall()
             )
+            shadow_rows = sum(db_stats["shadow_decisions"].values())
         if "entries" in tables:
             row = conn.execute(
                 "SELECT COUNT(*), COALESCE(SUM(hit_count), 0) FROM entries"
             ).fetchone()
             db_stats["entries"] = row[0]
             db_stats["hit_count_sum"] = row[1]
+        # Upstream tokens seen by the proxy. Sum each upstream response once.
+        # Shadow mode stores every fresh response in shadow_log and in entries.
+        # Count shadow_log only there. Live arms store miss responses in entries.
+        if shadow_rows:
+            source = conn.execute(
+                "SELECT fresh_json FROM shadow_log WHERE fresh_json IS NOT NULL"
+            )
+        elif "entries" in tables:
+            source = conn.execute("SELECT response_json FROM entries")
+        else:
+            source = []
+        for (body,) in source:
+            prompt, completion = usage_tokens(body)
+            upstream_prompt += prompt
+            upstream_completion += completion
         conn.close()
+    db_stats["upstream_prompt_tokens"] = upstream_prompt
+    db_stats["upstream_completion_tokens"] = upstream_completion
     return report, db_stats
+
+
+def usage_tokens(body):
+    """Read prompt and completion tokens from one stored response body."""
+    try:
+        usage = json.loads(body).get("usage") or {}
+        return int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+    except (ValueError, TypeError, AttributeError):
+        return 0, 0
 
 
 def abort_reason(report):
@@ -91,6 +123,27 @@ def task_rows(report):
     return rows
 
 
+def splice_tokens(report):
+    """Sum the usage samples that splice reported across all tasks."""
+    benchmark = report.get("benchmark") or {}
+    prompt = 0
+    completion = 0
+    for task in benchmark.get("tasks") or []:
+        agent = task.get("agent") or {}
+        for sample in agent.get("usageSamples") or []:
+            prompt += sample.get("inputTokens") or 0
+            completion += sample.get("outputTokens") or 0
+    return prompt, completion
+
+
+def status_counts(rows):
+    """Count the report status values across tasks."""
+    counts = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    return counts
+
+
 def main():
     run_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "runs", "latest"
@@ -116,6 +169,18 @@ def main():
         rows = task_rows(report)
         if not rows:
             print("  no tasks in report")
+        print(f"  tasks: {status_counts(rows)}")
+        in_tok, out_tok = splice_tokens(report)
+        print(f"  splice tokens: input={in_tok} output={out_tok}")
+        print(
+            "  upstream tokens: prompt={} completion={}".format(
+                db_stats.get("upstream_prompt_tokens", 0),
+                db_stats.get("upstream_completion_tokens", 0),
+            )
+        )
+        if arm == "ld3":
+            # ld3 declines to store some misses. Those tokens do not appear here.
+            print("  note: ld3 upstream tokens count stored responses only")
         for row in rows:
             print(
                 "  task {task}: status={status} exit={exit} "

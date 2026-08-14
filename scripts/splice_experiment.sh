@@ -1,6 +1,6 @@
 #!/bin/sh
 # Run the Phase 6.3 control-loop experiment.
-# Arms: baseline (shadow mode, pass-through), static, ld3.
+# Arms: baseline (shadow mode, pass-through), exact (exact-only mode), static, ld3.
 # Every arm shares the proxy path so the arms differ in serving only.
 set -e
 
@@ -119,15 +119,17 @@ EOF
 fi
 
 # Each arm runs the same suite against the same proxy port.
-for ARM in baseline static ld3; do
+for ARM in baseline exact static ld3; do
     case "$ARM" in
         baseline) FLAGS="CACHE_SHADOW=1" ;;
+        exact)    FLAGS="CACHE_EXACT_ONLY_MODELS=$MODEL" ;;
         static)   FLAGS="SEMANTIC_POLICY=static" ;;
         ld3)      FLAGS="SEMANTIC_POLICY=ld3" ;;
     esac
     start_proxy "$ARM" $FLAGS
-    # The task fails by design, so eval bench exits non-zero. The report is the output.
-    env XDG_CONFIG_HOME="$XDG_DIR" splice eval bench \
+    # The cycle-forcing tasks fail by design, so eval bench can exit non-zero.
+    # The report is the output.
+    env XDG_CONFIG_HOME="$XDG_DIR" "$SPLICE_BIN" eval bench \
         --suite "$SUITE" \
         --report-dir "$WORK_DIR/$ARM" \
         --timeout 5m \

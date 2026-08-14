@@ -143,6 +143,10 @@ past its escalation to its own exit mode. The monitor fires. Nothing acts on it.
 One run per arm. The iteration counts and abort reasons are single samples. The escalation
 marker count comes from the stream-json stdout.
 
+After run 3: the suite gained two passable functionality tasks and the runner gained a
+fourth exact-only arm. The diff script reports per-arm token costs. The next run measures
+token cost and Splice functionality with and without the cache.
+
 ## Reproduce
 
 ```bash
