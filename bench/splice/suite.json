@@ -76,19 +76,19 @@
         "functionality"
       ],
       "difficulty": "easy",
-      "prompt": "Update math_helpers.js. Add a function double(x) that returns x * 2 and export it with module.exports. The file currently holds only a comment. Keep that comment. Tests live in math_helpers.test.js. Run them with node --test.",
+      "prompt": "Update mathhelpers.go. Add an exported function Double(x int) int that returns x * 2. The file currently holds only the package clause and a comment. Keep both. Tests live in mathhelpers_test.go. Run them with go test ./...",
       "workspaceFixture": "fixtures/task3",
       "expectedChangedFiles": [
-        "math_helpers.js"
+        "mathhelpers.go"
       ],
       "verificationCommands": [
         {
           "id": "double-works",
           "name": "double returns twice the input",
           "command": [
-            "node",
-            "-e",
-            "const {double} = require('./math_helpers'); if (double(4) !== 8) process.exit(1)"
+            "go",
+            "test",
+            "./..."
           ]
         }
       ]
@@ -101,19 +101,19 @@
         "functionality"
       ],
       "difficulty": "easy",
-      "prompt": "Update text_utils.js. The function firstWord crashes on an empty string. Make it return an empty string for empty input. Keep its behavior on non-empty input. Do not add any other files. Tests live in text_utils.test.js. Run them with node --test.",
+      "prompt": "Update textutils.go. The function FirstWord panics on an empty string. Make it return an empty string for empty input. Keep its behavior on non-empty input. Do not add any other files. Tests live in textutils_test.go. Run them with go test ./...",
       "workspaceFixture": "fixtures/task4",
       "expectedChangedFiles": [
-        "text_utils.js"
+        "textutils.go"
       ],
       "verificationCommands": [
         {
           "id": "first-word-works",
           "name": "first_word handles empty input",
           "command": [
-            "node",
-            "-e",
-            "const {firstWord} = require('./text_utils'); if (firstWord('hi there') !== 'hi' || firstWord('') !== '') process.exit(1)"
+            "go",
+            "test",
+            "./..."
           ]
         }
       ]
