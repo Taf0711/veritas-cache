@@ -20,6 +20,7 @@ if [ -z "${SPLICE_BIN:-}" ]; then
     fi
 fi
 MODEL="${SPLICE_EXPERIMENT_MODEL:-openai/gpt-4o-mini}"
+echo "info: experiment model is $MODEL"
 
 # The proxy resolves its model files relative to the working directory.
 cd "$REPO_ROOT"
