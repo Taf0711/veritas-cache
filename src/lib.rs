@@ -318,7 +318,23 @@ pub fn cache_key(request: &ChatRequest) -> Result<String, serde_json::Error> {
 
 // Join all messages into one embedding string.
 // Each message becomes one line in the form "role: content".
+// Build the embedding text for a chat request.
+// Embed the last user message. Harness system prompts fill the small
+// tokenizer window with boilerplate and hide the actual request otherwise.
+// Fall back to the full join when no user message exists.
 pub fn prompt_text(request: &ChatRequest) -> String {
+    let last_user = request.messages.iter().rev().find(|msg| {
+        msg.get("role").and_then(|v| v.as_str()) == Some("user")
+            && msg.get("content").and_then(|v| v.as_str()).is_some()
+    });
+    if let Some(msg) = last_user {
+        let content = msg
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return format!("user: {}", content);
+    }
     let mut lines = Vec::with_capacity(request.messages.len());
     for msg in &request.messages {
         let role = msg
@@ -1119,6 +1135,28 @@ mod tests {
             .unwrap();
         let count: i64 = stmt.query_row([&key], |row| row.get(0)).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn prompt_text_embeds_the_last_user_message() {
+        let multi: ChatRequest = serde_json::from_value(json!({
+            "model": "mock",
+            "messages": [
+                {"role": "system", "content": "long harness boilerplate"},
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": "second question"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(prompt_text(&multi), "user: second question");
+
+        let single: ChatRequest = serde_json::from_value(json!({
+            "model": "mock",
+            "messages": [{"role": "user", "content": "only question"}]
+        }))
+        .unwrap();
+        assert_eq!(prompt_text(&single), "user: only question");
     }
 
     #[test]
