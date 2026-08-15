@@ -80,7 +80,7 @@ run_task() {
     mkdir -p "$TASK_DIR"
     OUT=$(cd "$TASK_DIR" && PI_CODING_AGENT_DIR="$AGENT_DIR" pi --provider veritas --model "$MODEL" -a -p "$PROMPT" 2>&1) || true
     if [ -f "$TASK_DIR/math_helpers.js" ]; then
-        if node -e "const {double} = require('$TASK_DIR/math_helpers.js'); if (double(4) !== 8) process.exit(1)" 2>/dev/null; then
+        if node -e "const m = require('$TASK_DIR/math_helpers.js'); const d = m.double ?? m; if (typeof d !== 'function' || d(4) !== 8) process.exit(1)" 2>/dev/null; then
             echo "PASS $LABEL produced a working double"
         else
             echo "FAIL $LABEL produced a broken double"
