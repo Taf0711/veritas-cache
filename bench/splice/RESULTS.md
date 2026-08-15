@@ -246,6 +246,63 @@ the two runs is 51 to 75 percent of upstream prompt tokens.
 One run per arm. One model. Small tasks. The ld3 upstream figure counts stored responses
 only. Its splice-reported input was 21,997 tokens.
 
+## Run 7 — first ld3s arm, head embedding (run dir 20260815-133344)
+
+Five arms. ld3s learns per stage and serves per session scope. This run still used head
+embedding (first 128 tokens of the joined prompt).
+
+| arm | tasks passed | upstream prompt tokens | hits served |
+|---|---|---|---|
+| baseline | 2 of 2 | 28,299 | 0 |
+| exact | 2 of 2 | 22,725 | 0 |
+| static | 1 of 2 | 7,716 | 13 |
+| ld3 | 2 of 2 | 9,946 | 0 |
+| ld3s | 2 of 2 | 8,668 | 3 |
+
+ld3s served the first bounded adaptive hits on agent traffic. Three hits, every task green,
+69 percent prompt savings against baseline. Static broke one passable task again: within one
+session and stage, iteration 1 responses served later iterations, because the head embedding
+collapsed every request to one vector.
+
+## The truncation finding
+
+models/tokenizer.json truncates at 128 tokens from the head. Harness system prompts exceed
+that alone, so every request in a session embedded the same boilerplate prefix. All sim 1.0
+hits in runs 1 to 7 were prefix collisions, not intent matches. Fixed in 3001f06: the proxy
+embeds the last user message. QQP bench prompts are single-turn and unaffected.
+
+## The free-loop finding (Pi harness)
+
+Under static serving with head embeddings, Pi received its first action as the answer to
+every later request and applied it 3,466 times in one session, about 7 requests per second.
+Hits are free, so nothing slowed the loop. The loop ran on cached bytes until killed. A
+semantic cache removes the cost gradient that normally bounds a stuck agent loop.
+
+## Run 8 — tail embeddings, five arms (run dir 20260815-134402)
+
+First run with last-user-message embedding (3001f06) and the ld3s arm. deepseek-v4-flash-0731.
+Every arm passed both passable tasks. The cycle tasks blocked by design in every arm.
+
+| arm | upstream prompt tokens | hits served |
+|---|---|---|
+| baseline | 25,601 | 0 |
+| exact | 22,261 | 0 |
+| static | 7,384 | 8 |
+| ld3 | full spend (0 stored misses) | 0 |
+| ld3s | 7,384 | 2 |
+
+Scoped static and scoped ld3s both cut upstream prompt tokens by 71 percent with full
+function. ld3s served 2 bounded hits against static's 8 unbounded ones. Baseline shadow
+decisions show 9 would-be semantic hits, down from 19 to 24 with head embeddings. Tail
+embedding cut the hittable surface to real intent matches. Per-entry ld3 served nothing for
+the third run in a row. The cold start is structural.
+
+### Caveats for run 8
+
+One run. One model. The cycle-task iterations differ per arm, so the savings percentage
+moves with model behavior. The safe reading: scoped semantic serving halves or better the
+prompt bill on this traffic without breaking tasks.
+
 ## Reproduce
 
 ```bash
