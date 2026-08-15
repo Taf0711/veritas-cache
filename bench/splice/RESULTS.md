@@ -199,6 +199,45 @@ sample.
 One run per arm. gpt-4o-mini again, not the intended deepseek model. Baseline task 1 ran
 289 seconds against a 300 second timeout, so cycle-task latencies are near the cap.
 
+## Run 5 — scope fix live, deepseek, four arms (run dir 20260815-121628)
+
+Model: deepseek/deepseek-v4-flash-0731. Fixture binary: splice dev 4d69ea2. The proxy ran
+with prompt_cache_key scoping on the semantic path (commit 03520a6).
+
+### Measured results
+
+| arm | tasks passed | upstream prompt tokens | hits served | cycle-task exit |
+|---|---|---|---|---|
+| baseline | 2 of 2 | 15,720 | 0 | budget |
+| exact | 2 of 2 | 19,959 | 0 | budget |
+| static | 2 of 2 | 7,634 | 8 | hard limit |
+| ld3 | 2 of 2 | 7,716 stored | 0 | budget |
+
+### The scope fix held
+
+Static serving passed both passable tasks. No cross-task contamination occurred. The
+baseline shadow log shows 5 would-be semantic hits, down from 15 to 24 in earlier runs.
+Scoping cut the hittable surface exactly as designed.
+
+### Cost with function intact
+
+Static serving cut upstream prompt tokens by 51 percent against baseline and kept every
+task green. The budget-brake finding persists: static exited the cycle tasks on the hard
+iteration limit while every other arm exited on budget. Static also failed fast. Its cycle
+tasks took 9 seconds against 176 to 266 seconds for baseline.
+
+### ld3 never served
+
+ld3 served zero hits. Its per-entry policy needs observations before it trusts a neighbor.
+Agent runs are short, four to ten requests per task. ld3 never accumulates enough evidence
+to serve within one run. On this traffic shape it behaves as exact-only. The cold start is
+the price of the error bound.
+
+### Caveats for run 5
+
+One run per arm. One model. Small tasks. The ld3 upstream figure counts stored responses
+only. Its splice-reported input was 21,997 tokens.
+
 ## Reproduce
 
 ```bash
