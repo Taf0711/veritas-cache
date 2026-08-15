@@ -1,9 +1,5 @@
-"""Tests for math_helpers. The double test fails until the task is done."""
-from math_helpers import add, double
-
-
-def test_add():
-    assert add(2, 3) == 5
+"""Tests for math_helpers. Fails until double exists."""
+from math_helpers import double
 
 
 def test_double():
