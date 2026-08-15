@@ -233,6 +233,14 @@ Agent runs are short, four to ten requests per task. ld3 never accumulates enoug
 to serve within one run. On this traffic shape it behaves as exact-only. The cold start is
 the price of the error bound.
 
+### Variance check (run 6, dir 20260815-125316)
+
+A second deepseek run on the same rig. All four arms passed both passable tasks again.
+Upstream prompt tokens: baseline 30,982, exact 30,040, static 7,716, ld3 9,077. Baseline
+doubled against run 5 while static stayed flat at 7.6 to 7.7 thousand. Cached serving held
+spend constant while uncached spend varied with model behavior. The static saving across
+the two runs is 51 to 75 percent of upstream prompt tokens.
+
 ### Caveats for run 5
 
 One run per arm. One model. Small tasks. The ld3 upstream figure counts stored responses
