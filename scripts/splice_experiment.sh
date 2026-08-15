@@ -125,6 +125,11 @@ EOF
     echo "PASS upstream probe"
 fi
 
+# Models expect a python command. Shim it to python3 for the agent shells.
+SHIM_DIR="$WORK_DIR/shim"
+mkdir -p "$SHIM_DIR"
+ln -sf "$(command -v python3)" "$SHIM_DIR/python"
+
 # Each arm runs the same suite against the same proxy port.
 for ARM in baseline exact static ld3; do
     case "$ARM" in
@@ -136,7 +141,7 @@ for ARM in baseline exact static ld3; do
     start_proxy "$ARM" $FLAGS
     # The cycle-forcing tasks fail by design, so eval bench can exit non-zero.
     # The report is the output.
-    env XDG_CONFIG_HOME="$XDG_DIR" "$SPLICE_BIN" eval bench \
+    env XDG_CONFIG_HOME="$XDG_DIR" PATH="$SHIM_DIR:$PATH" "$SPLICE_BIN" eval bench \
         --suite "$SUITE" \
         --report-dir "$WORK_DIR/$ARM" \
         --timeout 5m \
