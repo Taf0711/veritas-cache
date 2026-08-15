@@ -17,11 +17,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{error, info};
-use veritas_cache::adaptive::Ld3Policy;
-use veritas_cache::policy::{Decision, Policy};
+use veritas_cache::adaptive::{AdaptivePolicy, Ld3Policy};
+use veritas_cache::policy::Decision;
 use veritas_cache::{
     assemble_from_sse, build_embedder, build_index, cache_key, canonical_json, count_tokens,
     embed, evict, increment_hits, increment_hits_by_rowid, init_db, insert_observation,
+    migrate_shadow_log,
     judge_content_equal, load_file_config, load_observations, lookup,
     insert_shadow_row, set_shadow_fresh,
     lookup_by_rowid, model_by_rowid, parse_exact_only_models, prompt_cache_key_by_rowid,
@@ -78,7 +79,7 @@ struct AppState {
     upstream_base: String,
     semantic_threshold: f32,
     policy_name: String,
-    adaptive_policy: Option<Arc<Mutex<Ld3Policy>>>,
+    adaptive_policy: Option<Arc<Mutex<AdaptivePolicy>>>,
     embedder: Arc<Mutex<Embedder>>,
     index: Arc<Hnsw<'static, f32, DistCosine>>,
     ttl_seconds: i64,
@@ -92,14 +93,26 @@ struct AppState {
 async fn log_shadow(
     state: &AppState,
     key: &str,
-    model: &str,
+    request: &ChatRequest,
     decision: &str,
     similarity: Option<f32>,
     would_serve_json: Option<&str>,
 ) -> Option<i64> {
     info!("shadow decision={} key={} sim={:?}", decision, key, similarity);
+    let request_json = serde_json::to_string(&canonical_json(
+        &serde_json::to_value(request).unwrap_or(Value::Null),
+    ))
+    .unwrap_or_default();
     let conn = state.db.lock().await;
-    match insert_shadow_row(&conn, key, model, decision, similarity, would_serve_json) {
+    match insert_shadow_row(
+        &conn,
+        key,
+        &request.model,
+        decision,
+        similarity,
+        would_serve_json,
+        &request_json,
+    ) {
         Ok(id) => Some(id),
         Err(e) => {
             error!("Failed to log shadow decision: {}", e);
@@ -156,7 +169,7 @@ async fn chat_completions(
             shadow_row_id = log_shadow(
                 &state,
                 &key,
-                &request.model,
+                &request,
                 "exact_hit",
                 None,
                 Some(&response_json),
@@ -242,14 +255,12 @@ async fn chat_completions(
     // Decide whether the semantic neighbor is a hit.
     let semantic_decision = if exact_only {
         Decision::Miss
-    } else if state.policy_name == "ld3" {
-        let mut policy = state
-            .adaptive_policy
-            .as_ref()
-            .expect("ld3 policy")
-            .lock()
-            .await;
-        policy.decide(best_match.map(|(rowid, similarity)| (rowid as usize, similarity)))
+    } else if let Some(policy) = &state.adaptive_policy {
+        let mut policy = policy.lock().await;
+        policy.decide(
+            request_scope.as_deref(),
+            best_match.map(|(rowid, similarity)| (rowid as usize, similarity)),
+        )
     } else {
         match best_match {
             Some((_, similarity)) if semantic_hit(similarity, state.semantic_threshold) => {
@@ -281,7 +292,7 @@ async fn chat_completions(
                 shadow_row_id = log_shadow(
                     &state,
                     &key,
-                    &request.model,
+                    &request,
                     "semantic_hit",
                     Some(similarity),
                     Some(&response_json),
@@ -311,7 +322,7 @@ async fn chat_completions(
         shadow_row_id = log_shadow(
             &state,
             &key,
-            &request.model,
+            &request,
             "miss",
             best_match.map(|(_, similarity)| similarity),
             None,
@@ -467,7 +478,11 @@ async fn maybe_store(
     };
 
     let mut should_store = true;
-    if state.policy_name == "ld3" {
+    if let Some(policy) = &state.adaptive_policy {
+        let scope = request
+            .extra
+            .get("prompt_cache_key")
+            .and_then(Value::as_str);
         if let Some((rowid, similarity)) = best_match {
             let cached_json = {
                 let conn = state.db.lock().await;
@@ -479,18 +494,13 @@ async fn maybe_store(
                 {
                     let correct = judge_content_equal(&cached_json, response_json);
                     {
-                        let mut policy = state
-                            .adaptive_policy
-                            .as_ref()
-                            .expect("ld3 policy")
-                            .lock()
-                            .await;
-                        policy.observe(rowid as usize, similarity, correct);
+                        let mut policy = policy.lock().await;
+                        policy.observe(scope, rowid as usize, similarity, correct);
                         should_store = policy.should_insert();
                     }
                     // Persist the observation so the policy survives a restart.
                     let conn = state.db.lock().await;
-                    if let Err(e) = insert_observation(&conn, rowid, similarity, correct) {
+                    if let Err(e) = insert_observation(&conn, rowid, similarity, correct, scope) {
                         error!("Failed to store observation: {}", e);
                     }
                 }
@@ -625,6 +635,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .unwrap_or_else(|| "cache.db".to_string());
     let conn = Connection::open(&db_path)?;
     init_db(&conn)?;
+    migrate_shadow_log(&conn)?;
     let db = Arc::new(Mutex::new(conn));
 
     let upstream_base = std::env::var("UPSTREAM_BASE_URL")
@@ -665,7 +676,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let adaptive_policy = match policy_name.as_str() {
         "static" => None,
-        "ld3" => {
+        "ld3" | "ld3s" => {
             let delta = std::env::var("ADAPTIVE_DELTA")
                 .ok()
                 .map(|value| value.parse::<f32>())
@@ -675,10 +686,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if !(0.0..=1.0).contains(&delta) {
                 return Err("ADAPTIVE_DELTA must be between 0 and 1".into());
             }
-            // Observations replay from the database after the index build.
-            Some(Arc::new(Mutex::new(Ld3Policy::new(delta))))
+            if policy_name == "ld3s" {
+                Some(Arc::new(Mutex::new(AdaptivePolicy::Scoped(
+                    veritas_cache::adaptive::ScopedLd3Policy::new(delta),
+                ))))
+            } else {
+                // Observations replay from the database after the index build.
+                Some(Arc::new(Mutex::new(AdaptivePolicy::Ld3(Ld3Policy::new(delta)))))
+            }
         }
-        other => return Err(format!("Unknown SEMANTIC_POLICY: {other}. Use static or ld3").into()),
+        other => {
+            return Err(format!("Unknown SEMANTIC_POLICY: {other}. Use static, ld3, or ld3s").into())
+        }
     };
 
     let client = reqwest::Client::builder()
@@ -695,7 +714,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let index = Arc::new(index);
 
     // Replay stored observations so an adaptive policy keeps its learned state.
-    // Each observe refits from the full per-entry vector. The replay order is the
+    // Each observe refits from the full per-key vector. The replay order is the
     // write order, so the final state matches a fresh in-memory run.
     if let Some(policy) = &adaptive_policy {
         let observations = {
@@ -704,8 +723,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
         let count = observations.len();
         let mut policy = policy.lock().await;
-        for (entry_rowid, similarity, correct) in observations {
-            policy.observe(entry_rowid as usize, similarity, correct);
+        for (entry_rowid, scope, similarity, correct) in observations {
+            policy.observe(scope.as_deref(), entry_rowid as usize, similarity, correct);
         }
         info!("replayed {} adaptive observations", count);
     }

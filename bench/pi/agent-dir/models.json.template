@@ -1,0 +1,12 @@
+{
+  "providers": {
+    "veritas": {
+      "baseUrl": "http://127.0.0.1:18091/v1",
+      "api": "openai-completions",
+      "apiKey": "$OPENROUTER_API_KEY",
+      "models": [
+        { "id": "__MODEL__" }
+      ]
+    }
+  }
+}

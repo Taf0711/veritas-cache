@@ -570,10 +570,27 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
         "CREATE TABLE IF NOT EXISTS observations (
             entry_rowid INTEGER NOT NULL,
             similarity REAL NOT NULL,
-            correct INTEGER NOT NULL
+            correct INTEGER NOT NULL,
+            scope TEXT
         )",
         [],
     )?;
+    // Add the scope column to databases that predate it.
+    let has_scope = {
+        let mut stmt = conn.prepare("PRAGMA table_info(observations)")?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "scope" {
+                found = true;
+            }
+        }
+        found
+    };
+    if !has_scope {
+        conn.execute("ALTER TABLE observations ADD COLUMN scope TEXT", [])?;
+    }
     conn.execute(
         "CREATE TABLE IF NOT EXISTS shadow_log (
             id INTEGER PRIMARY KEY,
@@ -583,10 +600,12 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
             decision TEXT NOT NULL,
             similarity REAL,
             would_serve_json TEXT,
-            fresh_json TEXT
+            fresh_json TEXT,
+            request_json TEXT
         )",
         [],
     )?;
+    migrate_shadow_log(conn)?;
     Ok(())
 }
 
@@ -644,29 +663,34 @@ pub fn increment_hits_by_rowid(conn: &Connection, rowid: i64) -> rusqlite::Resul
 }
 
 // Append one adaptive-policy observation for a cache entry.
+// The scope is the prompt cache key of the request when one exists.
 pub fn insert_observation(
     conn: &Connection,
     entry_rowid: i64,
     similarity: f32,
     correct: bool,
+    scope: Option<&str>,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO observations (entry_rowid, similarity, correct) VALUES (?1, ?2, ?3)",
-        params![entry_rowid, similarity, correct as i64],
+        "INSERT INTO observations (entry_rowid, similarity, correct, scope) VALUES (?1, ?2, ?3, ?4)",
+        params![entry_rowid, similarity, correct as i64, scope],
     )?;
     Ok(())
 }
 
 // Load every observation in write order for a boot-time policy replay.
-pub fn load_observations(conn: &Connection) -> rusqlite::Result<Vec<(i64, f32, bool)>> {
+// Return (entry_rowid, scope, similarity, correct) per row.
+pub fn load_observations(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(i64, Option<String>, f32, bool)>> {
     let mut stmt = conn.prepare(
-        "SELECT entry_rowid, similarity, correct FROM observations ORDER BY rowid",
+        "SELECT entry_rowid, scope, similarity, correct FROM observations ORDER BY rowid",
     )?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
-        let correct: i64 = row.get(2)?;
-        out.push((row.get(0)?, row.get(1)?, correct != 0));
+        let correct: i64 = row.get(3)?;
+        out.push((row.get(0)?, row.get(1)?, row.get(2)?, correct != 0));
     }
     Ok(out)
 }
@@ -680,14 +704,35 @@ pub fn insert_shadow_row(
     decision: &str,
     similarity: Option<f32>,
     would_serve_json: Option<&str>,
+    request_json: &str,
 ) -> rusqlite::Result<i64> {
     conn.execute(
         "INSERT INTO shadow_log
-         (ts, key_hash, model, decision, similarity, would_serve_json, fresh_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-        params![unix_now(), key_hash, model, decision, similarity, would_serve_json],
+         (ts, key_hash, model, decision, similarity, would_serve_json, fresh_json, request_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+        params![unix_now(), key_hash, model, decision, similarity, would_serve_json, request_json],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+// Add the request column to shadow logs that predate it.
+pub fn migrate_shadow_log(conn: &Connection) -> rusqlite::Result<()> {
+    let has_column = {
+        let mut stmt = conn.prepare("PRAGMA table_info(shadow_log)")?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "request_json" {
+                found = true;
+            }
+        }
+        found
+    };
+    if !has_column {
+        conn.execute("ALTER TABLE shadow_log ADD COLUMN request_json TEXT", [])?;
+    }
+    Ok(())
 }
 
 // Attach the fresh upstream response to a shadow row.
@@ -1109,7 +1154,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
-        let id = insert_shadow_row(&conn, "key-a", "mock", "exact_hit", None, Some("{\"old\":1}"))
+        let id = insert_shadow_row(&conn, "key-a", "mock", "exact_hit", None, Some("{\"old\":1}"), "{}")
             .unwrap();
         set_shadow_fresh(&conn, id, "{\"new\":2}").unwrap();
 
@@ -1140,7 +1185,7 @@ mod tests {
         assert_eq!(row.6.as_deref(), Some("{\"new\":2}"));
 
         // A miss row carries a similarity when a neighbor was rejected.
-        let id2 = insert_shadow_row(&conn, "key-b", "mock", "miss", Some(0.5), None).unwrap();
+        let id2 = insert_shadow_row(&conn, "key-b", "mock", "miss", Some(0.5), None, "{}").unwrap();
         let sim: Option<f32> = conn
             .query_row(
                 "SELECT similarity FROM shadow_log WHERE id = ?1",
@@ -1156,24 +1201,39 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
-        insert_observation(&conn, 7, 0.91, true).unwrap();
-        insert_observation(&conn, 7, 0.72, false).unwrap();
-        insert_observation(&conn, 11, 0.88, true).unwrap();
+        insert_observation(&conn, 7, 0.91, true, Some("sess-1:code_writer")).unwrap();
+        insert_observation(&conn, 7, 0.72, false, Some("sess-2:code_writer")).unwrap();
+        insert_observation(&conn, 11, 0.88, true, None).unwrap();
 
         let rows = load_observations(&conn).unwrap();
         assert_eq!(rows.len(), 3);
 
-        let for_seven: Vec<&(i64, f32, bool)> = rows.iter().filter(|r| r.0 == 7).collect();
+        let for_seven: Vec<&(i64, Option<String>, f32, bool)> =
+            rows.iter().filter(|r| r.0 == 7).collect();
         assert_eq!(for_seven.len(), 2);
-        assert!((for_seven[0].1 - 0.91).abs() < 1e-6);
-        assert!(for_seven[0].2);
-        assert!((for_seven[1].1 - 0.72).abs() < 1e-6);
-        assert!(!for_seven[1].2);
+        assert!((for_seven[0].2 - 0.91).abs() < 1e-6);
+        assert!(for_seven[0].3);
+        assert!((for_seven[1].2 - 0.72).abs() < 1e-6);
+        assert!(!for_seven[1].3);
 
-        let for_eleven: Vec<&(i64, f32, bool)> = rows.iter().filter(|r| r.0 == 11).collect();
+        let for_eleven: Vec<&(i64, Option<String>, f32, bool)> =
+            rows.iter().filter(|r| r.0 == 11).collect();
         assert_eq!(for_eleven.len(), 1);
-        assert!((for_eleven[0].1 - 0.88).abs() < 1e-6);
-        assert!(for_eleven[0].2);
+        assert!((for_eleven[0].2 - 0.88).abs() < 1e-6);
+        assert!(for_eleven[0].3);
+
+        // Scope roundtrip: two sessions of one stage group together. NULL stays NULL.
+        let mut by_scope: std::collections::HashMap<Option<String>, usize> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            let scope = row.1.as_deref().map(|s| {
+                let key = s.rsplit_once(':').map(|(_, stage)| stage).unwrap_or(s);
+                key.to_string()
+            });
+            *by_scope.entry(scope).or_default() += 1;
+        }
+        assert_eq!(by_scope.get(&Some("code_writer".to_string())), Some(&2));
+        assert_eq!(by_scope.get(&None), Some(&1));
     }
 
     // Insert one entry with explicit timestamps. Return its rowid.
@@ -1195,8 +1255,8 @@ mod tests {
         let now = 1_000_000;
         let old = insert_entry(&conn, "old", 1_000, 1_000);
         let fresh = insert_entry(&conn, "fresh", 999_999, 999_999);
-        insert_observation(&conn, old, 0.9, true).unwrap();
-        insert_observation(&conn, fresh, 0.8, false).unwrap();
+        insert_observation(&conn, old, 0.9, true, None).unwrap();
+        insert_observation(&conn, fresh, 0.8, false, None).unwrap();
 
         let deleted = evict(&conn, 3600, 0, now).unwrap();
         assert_eq!(deleted, 1);
@@ -1214,7 +1274,7 @@ mod tests {
         let oldest = insert_entry(&conn, "a", 100, 100);
         let middle = insert_entry(&conn, "b", 100, 200);
         let newest = insert_entry(&conn, "c", 100, 300);
-        insert_observation(&conn, oldest, 0.9, true).unwrap();
+        insert_observation(&conn, oldest, 0.9, true, None).unwrap();
 
         let deleted = evict(&conn, 0, 2, 1_000).unwrap();
         assert_eq!(deleted, 1);

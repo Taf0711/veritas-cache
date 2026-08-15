@@ -21,3 +21,4 @@ cache.db*
 __pycache__/
 bench/splice/runs/
 bench/splice/bin/
+bench/pi/runs/

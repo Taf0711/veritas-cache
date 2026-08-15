@@ -1,6 +1,7 @@
 use crate::policy::{Decision, Policy};
 use rand::Rng;
 use rand_chacha::{rand_core::SeedableRng, ChaCha8Rng};
+use std::collections::HashMap;
 
 const MIN_OBSERVATIONS: usize = 5;
 const FIT_STEPS: usize = 100;
@@ -302,6 +303,145 @@ impl Policy for Ld3Policy {
     }
 }
 
+// Pick the learning key for one request.
+// Requests with a prompt cache key learn per stage across sessions.
+// Other traffic learns per entry, which matches Ld3Policy behavior.
+pub fn learn_key(prompt_cache_key: Option<&str>, entry_rowid: i64) -> String {
+    if let Some(key) = prompt_cache_key {
+        if let Some(pos) = key.rfind(':') {
+            return key[pos + 1..].to_string();
+        }
+    }
+    format!("entry:{entry_rowid}")
+}
+
+// Hold the learned state of one learning key.
+#[derive(Default)]
+struct KeyState {
+    observations: Vec<(f32, bool)>,
+    fit: Option<(f32, f32)>,
+    bounds: Vec<f32>,
+}
+
+// Fit one sigmoid per learning key and bound each threshold with bootstrap samples.
+// Keys come from learn_key. Agent traffic pools evidence per stage.
+pub struct ScopedLd3Policy {
+    pub delta: f32,
+    states: HashMap<String, KeyState>,
+    rng: ChaCha8Rng,
+    last_correct: Option<bool>,
+}
+
+impl ScopedLd3Policy {
+    pub fn new(delta: f32) -> Self {
+        Self {
+            delta,
+            states: HashMap::new(),
+            rng: ChaCha8Rng::seed_from_u64(42),
+            last_correct: None,
+        }
+    }
+
+    // Recompute the bootstrap bounds of one key. Mirror Ld3Policy::refit_bound.
+    fn refit_bound(&mut self, key: &str) {
+        let state = match self.states.get_mut(key) {
+            Some(state) => state,
+            None => return,
+        };
+        let observations = &state.observations;
+        let mut values = Vec::with_capacity(BOOTSTRAPS);
+        for _ in 0..BOOTSTRAPS {
+            let sample: Vec<_> = (0..observations.len())
+                .map(|_| observations[self.rng.gen_range(0..observations.len())])
+                .collect();
+            if let Some((threshold, _)) = fit(&sample) {
+                values.push(threshold);
+            }
+        }
+        values.sort_by(|a, b| a.total_cmp(b));
+        if values.is_empty() {
+            if let Some((threshold, _)) = state.fit {
+                values.push(threshold);
+            }
+        }
+        state.bounds = values;
+    }
+
+    // Decide with the learning key of the current request.
+    pub fn decide_scoped(&mut self, scope: Option<&str>, neighbor: Option<(usize, f32)>) -> Decision {
+        reset_last_observation(&mut self.last_correct);
+        let Some((entry, similarity)) = neighbor else {
+            return Decision::Miss;
+        };
+        let key = learn_key(scope, entry as i64);
+        let Some(state) = self.states.get(&key) else {
+            return Decision::Miss;
+        };
+        let Some((_, gamma)) = state.fit else {
+            return Decision::Miss;
+        };
+        if state.bounds.is_empty() {
+            return Decision::Miss;
+        }
+
+        let mut tau_hat = 1.0f32;
+        for step in 0..20 {
+            let epsilon = 0.01 + step as f32 * 0.98 / 19.0;
+            let index = ((state.bounds.len() - 1) as f32 * epsilon) as usize;
+            let threshold = state.bounds[index];
+            let alpha = laplace_cap(
+                (1.0 - epsilon) * sigmoid(gamma * (similarity - threshold)),
+                state.observations.len(),
+            );
+            tau_hat = tau_hat.min(tau(self.delta, alpha));
+        }
+        draw_decision(&mut self.rng, tau_hat)
+    }
+
+    // Record one judgment under the learning key of the request.
+    pub fn observe_scoped(&mut self, scope: Option<&str>, entry: usize, similarity: f32, correct: bool) {
+        self.last_correct = Some(correct);
+        let key = learn_key(scope, entry as i64);
+        let state = self.states.entry(key.clone()).or_default();
+        state.observations.push((similarity, correct));
+        state.fit = fit_or_confident(&state.observations);
+        self.refit_bound(&key);
+    }
+
+    pub fn should_insert(&self) -> bool {
+        should_insert(self.last_correct)
+    }
+}
+
+// Dispatch between the per-entry policy and the scoped policy.
+pub enum AdaptivePolicy {
+    Ld3(Ld3Policy),
+    Scoped(ScopedLd3Policy),
+}
+
+impl AdaptivePolicy {
+    pub fn decide(&mut self, scope: Option<&str>, neighbor: Option<(usize, f32)>) -> Decision {
+        match self {
+            Self::Ld3(policy) => policy.decide(neighbor),
+            Self::Scoped(policy) => policy.decide_scoped(scope, neighbor),
+        }
+    }
+
+    pub fn observe(&mut self, scope: Option<&str>, entry: usize, similarity: f32, correct: bool) {
+        match self {
+            Self::Ld3(policy) => policy.observe(entry, similarity, correct),
+            Self::Scoped(policy) => policy.observe_scoped(scope, entry, similarity, correct),
+        }
+    }
+
+    pub fn should_insert(&self) -> bool {
+        match self {
+            Self::Ld3(policy) => policy.should_insert(),
+            Self::Scoped(policy) => policy.should_insert(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,6 +601,71 @@ mod tests {
             .events
             .iter()
             .all(|event| { event.decision == Decision::Miss || event.correct.is_some() }));
+    }
+
+    #[test]
+    fn learn_key_splits_on_the_last_colon() {
+        assert_eq!(learn_key(Some("sess-1:code_writer"), 7), "code_writer");
+        assert_eq!(learn_key(Some("a:b:c"), 7), "c");
+        assert_eq!(learn_key(Some("no-colon"), 7), "entry:7");
+        assert_eq!(learn_key(None, 7), "entry:7");
+    }
+
+    #[test]
+    fn scoped_policy_serves_only_the_trained_key() {
+        let mut policy = ScopedLd3Policy::new(0.05);
+        for _ in 0..6 {
+            policy.observe_scoped(Some("run-1:code_writer"), 3, 0.95, true);
+        }
+        // A high-similarity neighbor under the same stage key draws hits.
+        let hits = (0..1000)
+            .filter(|_| {
+                policy.decide_scoped(Some("run-2:code_writer"), Some((9, 0.99))) == Decision::Hit
+            })
+            .count();
+        assert!(hits > 0, "hits={hits}");
+        // A different stage key has no state and always misses.
+        for _ in 0..100 {
+            assert_eq!(
+                policy.decide_scoped(Some("run-2:test_generator"), Some((9, 0.99))),
+                Decision::Miss
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_policy_falls_back_to_per_entry_keys() {
+        let mut policy = ScopedLd3Policy::new(0.05);
+        for _ in 0..6 {
+            policy.observe_scoped(None, 5, 0.95, true);
+        }
+        let hits = (0..1000)
+            .filter(|_| policy.decide_scoped(None, Some((5, 0.99))) == Decision::Hit)
+            .count();
+        assert!(hits > 0, "hits={hits}");
+        // An untrained entry key always misses.
+        for _ in 0..100 {
+            assert_eq!(policy.decide_scoped(None, Some((6, 0.99))), Decision::Miss);
+        }
+        // A named scope misses too. The entry evidence lives under its own key.
+        for _ in 0..100 {
+            assert_eq!(
+                policy.decide_scoped(Some("run-1:code_writer"), Some((5, 0.99))),
+                Decision::Miss
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_policy_matures_to_near_full_serving() {
+        let mut policy = ScopedLd3Policy::new(0.05);
+        for _ in 0..200 {
+            policy.observe_scoped(Some("run-1:stage"), 0, 0.8, true);
+        }
+        let hits = (0..1000)
+            .filter(|_| policy.decide_scoped(Some("run-2:stage"), Some((0, 0.95))) == Decision::Hit)
+            .count();
+        assert!(hits > 950, "hits={hits}");
     }
 
     #[test]
