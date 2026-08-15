@@ -147,6 +147,58 @@ After run 3: the suite gained two passable functionality tasks and the runner ga
 fourth exact-only arm. The diff script reports per-arm token costs. The next run measures
 token cost and Splice functionality with and without the cache.
 
+## Run 4 — passable tasks, four arms, cost and function (run dir 20260814-235738)
+
+Model: openai/gpt-4o-mini (the deepseek override did not reach this run). Fixture binary:
+splice dev 4d69ea2 with the SD17 analyzer fix. Four arms: baseline, exact, static, ld3.
+
+### Measured results
+
+| arm | tasks passed | upstream prompt tokens | upstream completion tokens | hits served |
+|---|---|---|---|---|
+| baseline | 2 of 2 passable | 27,005 | 5,864 | 0 |
+| exact | 2 of 2 passable | 21,411 | 12,308 | 0 |
+| static | 0 of 2 passable | 1,798 | 410 | 19 |
+| ld3 | 1 of 2 passable | 1,798 stored | 698 stored | 8 |
+
+The cycle-forcing tasks blocked in every arm as designed. Splice-reported input for ld3 was
+17,332 tokens. Its true upstream spend sits between the stored figure and that figure.
+
+### Static serving broke both passable tasks through cross-task contamination
+
+The static arm stored one entry on its first request and served it to 19 later requests.
+The transcript of add-double-helper shows code_writer proposing changes to greeting.py.
+That file belongs to a different task. Task 1 and task 3 ask for similar edits to small
+files, so the prompts embed near each other. The cache cannot tell tasks apart. The agent
+edited the wrong file with full confidence and the verifier blocked every iteration.
+
+This is a second failure mode, distinct from the tool-envelope mechanism of run 2. Semantic
+serving corrupts agent work product across task boundaries. No escalation or error surfaced
+it. The run just failed.
+
+### ld3 broke one of two
+
+ld3 served 8 hits before its observations raised the entry threshold. One early cross-task
+hit was enough to sink add-double-helper. fix-first-word passed.
+
+### The exact-only contract holds
+
+The exact arm passed both passable tasks with zero semantic risk. Its zero exact hits on
+this run mean its token difference from baseline is model variance, not cache effect. The
+contract value case (verbatim retries, crash resume) did not occur on this traffic.
+
+### Cost answer
+
+Static serving cut upstream prompt tokens by 93 percent on this run. It also broke every
+passable task. The savings are real. So is the corruption. Exact-only keeps function at
+full price. ld3 sits between: most of the savings, some of the corruption, on this small
+sample.
+
+### Caveats for run 4
+
+One run per arm. gpt-4o-mini again, not the intended deepseek model. Baseline task 1 ran
+289 seconds against a 300 second timeout, so cycle-task latencies are near the cap.
+
 ## Reproduce
 
 ```bash
