@@ -1,6 +1,6 @@
 #!/bin/sh
 # Run the Phase 6.3 control-loop experiment.
-# Arms: baseline (shadow mode, pass-through), exact (exact-only mode), static, ld3.
+# Arms: baseline (shadow mode, pass-through), exact (exact-only mode), static, ld3, ld3s.
 # Every arm shares the proxy path so the arms differ in serving only.
 set -e
 
@@ -139,12 +139,13 @@ mkdir -p "$SHIM_DIR"
 ln -sf "$(command -v python3)" "$SHIM_DIR/python"
 
 # Each arm runs the same suite against the same proxy port.
-for ARM in baseline exact static ld3; do
+for ARM in baseline exact static ld3 ld3s; do
     case "$ARM" in
         baseline) FLAGS="CACHE_SHADOW=1" ;;
         exact)    FLAGS="CACHE_EXACT_ONLY_MODELS=$MODEL" ;;
         static)   FLAGS="SEMANTIC_POLICY=static" ;;
         ld3)      FLAGS="SEMANTIC_POLICY=ld3" ;;
+        ld3s)     FLAGS="SEMANTIC_POLICY=ld3s" ;;
     esac
     start_proxy "$ARM" $FLAGS
     # The cycle-forcing tasks fail by design, so eval bench can exit non-zero.

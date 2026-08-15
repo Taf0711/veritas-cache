@@ -15,7 +15,7 @@ import re
 import sqlite3
 import sys
 
-ARMS = ["baseline", "exact", "static", "ld3"]
+ARMS = ["baseline", "exact", "static", "ld3", "ld3s"]
 
 
 def load_arm(run_dir, arm):
@@ -178,8 +178,8 @@ def main():
                 db_stats.get("upstream_completion_tokens", 0),
             )
         )
-        if arm == "ld3":
-            # ld3 declines to store some misses. Those tokens do not appear here.
+        if arm in ("ld3", "ld3s"):
+            # ld3 and ld3s decline to store some misses. Those tokens do not appear here.
             print("  note: ld3 upstream tokens count stored responses only")
         for row in rows:
             print(
