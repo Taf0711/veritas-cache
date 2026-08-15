@@ -303,6 +303,13 @@ One run. One model. The cycle-task iterations differ per arm, so the savings per
 moves with model behavior. The safe reading: scoped semantic serving halves or better the
 prompt bill on this traffic without breaking tasks.
 
+### Pi run 4 (20260815-135500, tail embedding of the true last message)
+
+The free loop is gone. The static arm served 2 bounded semantic hits and stopped. All tasks
+produced working code. One caveat: the first tail-embedding pass (3001f06) still looped,
+because agent sessions keep one constant last USER message while later turns arrive as tool
+results. d311373 embeds the last message of any role. Each turn now gets its own vector.
+
 ## Reproduce
 
 ```bash
