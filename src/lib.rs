@@ -319,21 +319,28 @@ pub fn cache_key(request: &ChatRequest) -> Result<String, serde_json::Error> {
 // Join all messages into one embedding string.
 // Each message becomes one line in the form "role: content".
 // Build the embedding text for a chat request.
-// Embed the last user message. Harness system prompts fill the small
-// tokenizer window with boilerplate and hide the actual request otherwise.
-// Fall back to the full join when no user message exists.
+// Embed the last message with string content, whatever its role.
+// Harness system prompts fill the small tokenizer window with boilerplate.
+// Agent turns after the first arrive as tool results, so the last user
+// message stays constant across a session. Only the tail of the
+// conversation changes per turn.
+// Fall back to the full join when no string content exists.
 pub fn prompt_text(request: &ChatRequest) -> String {
-    let last_user = request.messages.iter().rev().find(|msg| {
-        msg.get("role").and_then(|v| v.as_str()) == Some("user")
-            && msg.get("content").and_then(|v| v.as_str()).is_some()
+    let last = request.messages.iter().rev().find(|msg| {
+        msg.get("content").and_then(|v| v.as_str()).is_some()
     });
-    if let Some(msg) = last_user {
+    if let Some(msg) = last {
+        let role = msg
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("user")
+            .to_string();
         let content = msg
             .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        return format!("user: {}", content);
+        return format!("{}: {}", role, content);
     }
     let mut lines = Vec::with_capacity(request.messages.len());
     for msg in &request.messages {
@@ -1157,6 +1164,19 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(prompt_text(&single), "user: only question");
+
+        // Agent turns arrive as tool results. The tail follows them.
+        let agent: ChatRequest = serde_json::from_value(json!({
+            "model": "mock",
+            "messages": [
+                {"role": "system", "content": "long harness boilerplate"},
+                {"role": "user", "content": "do the task"},
+                {"role": "assistant", "content": "calling the write tool"},
+                {"role": "tool", "content": "wrote 57 bytes"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(prompt_text(&agent), "tool: wrote 57 bytes");
     }
 
     #[test]
