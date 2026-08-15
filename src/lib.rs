@@ -611,6 +611,20 @@ pub fn model_by_rowid(conn: &Connection, rowid: i64) -> rusqlite::Result<Option<
         .optional()
 }
 
+// Read the prompt cache key of a stored entry. Agent clients like Splice send
+// this field to scope one run and stage. Semantic hits must stay inside one scope.
+pub fn prompt_cache_key_by_rowid(
+    conn: &Connection,
+    rowid: i64,
+) -> rusqlite::Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(request_json, '$.prompt_cache_key') FROM entries WHERE rowid = ?1",
+    )?;
+    stmt.query_row([rowid], |row| row.get::<_, Option<String>>(0))
+        .optional()
+        .map(|row| row.flatten())
+}
+
 // Increase the hit counter for a cached entry and record the access time.
 pub fn increment_hits(conn: &Connection, key: &str) -> rusqlite::Result<()> {
     conn.execute(
@@ -1060,6 +1074,34 @@ mod tests {
             .unwrap();
         let count: i64 = stmt.query_row([&key], |row| row.get(0)).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn prompt_cache_key_by_rowid_reads_the_scope() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let request = json!({
+            "model": "mock",
+            "messages": [{"role": "user", "content": "hi"}],
+            "prompt_cache_key": "session-1:code_writer"
+        });
+        let rowid = store(
+            &conn,
+            "key-scope",
+            &request.to_string(),
+            "{}",
+            "mock",
+            &[1.0, 0.0],
+        )
+        .unwrap();
+        let scoped = prompt_cache_key_by_rowid(&conn, rowid).unwrap();
+        assert_eq!(scoped.as_deref(), Some("session-1:code_writer"));
+
+        // An entry without the field reads as None.
+        let bare = json!({"model": "mock", "messages": []});
+        let rowid2 = store(&conn, "key-bare", &bare.to_string(), "{}", "mock", &[1.0, 0.0])
+            .unwrap();
+        assert_eq!(prompt_cache_key_by_rowid(&conn, rowid2).unwrap(), None);
     }
 
     #[test]

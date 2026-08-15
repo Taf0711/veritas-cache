@@ -24,7 +24,8 @@ use veritas_cache::{
     embed, evict, increment_hits, increment_hits_by_rowid, init_db, insert_observation,
     judge_content_equal, load_file_config, load_observations, lookup,
     insert_shadow_row, set_shadow_fresh,
-    lookup_by_rowid, model_by_rowid, parse_exact_only_models, prompt_text, render_sse,
+    lookup_by_rowid, model_by_rowid, parse_exact_only_models, prompt_cache_key_by_rowid,
+    prompt_text, render_sse,
     response_content, semantic_hit, store, synthesize_usage, unix_now, ChatRequest, Embedder,
     ErrorResponse,
 };
@@ -194,6 +195,12 @@ async fn chat_completions(
     };
 
     // Search the HNSW index and post-filter by model.
+    // When the request carries a prompt cache key, keep hits inside that scope.
+    let request_scope = request
+        .extra
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(String::from);
     let best_match = if exact_only {
         None
     } else {
@@ -212,6 +219,16 @@ async fn chat_completions(
                 }
             };
             if model == request.model {
+                if let Some(scope) = &request_scope {
+                    match prompt_cache_key_by_rowid(&conn, rowid) {
+                        Ok(Some(stored)) if &stored == scope => {}
+                        Ok(_) => continue,
+                        Err(e) => {
+                            error!("Failed to read prompt cache key for rowid {}: {}", rowid, e);
+                            continue;
+                        }
+                    }
+                }
                 match best {
                     None => best = Some((rowid, similarity)),
                     Some((_, current)) if similarity > current => best = Some((rowid, similarity)),

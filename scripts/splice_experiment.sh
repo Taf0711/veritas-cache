@@ -35,11 +35,18 @@ if ! command -v "$SPLICE_BIN" >/dev/null 2>&1; then
     echo "FAIL splice binary not found: $SPLICE_BIN"
     exit 1
 fi
-# A real run needs the upstream key. The key never lands in a file.
+# A real run needs the upstream key. The key never lands in a file in the repo.
+# The runner reads it from the environment first, then from a file outside the repo.
 # The fixture config names the env var. Splice reads it from its own environment.
 # Dry-run mode makes no upstream calls, so it skips this check.
+KEY_FILE="$HOME/.config/veritas-cache/openrouter_key"
+if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$KEY_FILE" ]; then
+    OPENROUTER_API_KEY=$(tr -d '[:space:]' < "$KEY_FILE")
+    export OPENROUTER_API_KEY
+    echo "info: using the key from $KEY_FILE"
+fi
 if [ "$DRY_RUN" = "0" ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
-    echo "FAIL OPENROUTER_API_KEY is not set"
+    echo "FAIL OPENROUTER_API_KEY is not set and $KEY_FILE is missing"
     exit 1
 fi
 
