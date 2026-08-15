@@ -76,19 +76,19 @@
         "functionality"
       ],
       "difficulty": "easy",
-      "prompt": "Update math_helpers.py. Add a function double(x) that returns x * 2. The file currently holds only a docstring. Keep that docstring. Tests live in test_math_helpers.py. Run them with python -m pytest. Verify with python3. The python command does not exist on this system.",
+      "prompt": "Update math_helpers.js. Add a function double(x) that returns x * 2 and export it with module.exports. The file currently holds only a comment. Keep that comment. Tests live in math_helpers.test.js. Run them with node --test.",
       "workspaceFixture": "fixtures/task3",
       "expectedChangedFiles": [
-        "math_helpers.py"
+        "math_helpers.js"
       ],
       "verificationCommands": [
         {
           "id": "double-works",
           "name": "double returns twice the input",
           "command": [
-            "python3",
-            "-c",
-            "from math_helpers import double; assert double(4) == 8"
+            "node",
+            "-e",
+            "const {double} = require('./math_helpers'); if (double(4) !== 8) process.exit(1)"
           ]
         }
       ]
@@ -101,19 +101,19 @@
         "functionality"
       ],
       "difficulty": "easy",
-      "prompt": "Update text_utils.py. The function first_word crashes on an empty string. Make it return an empty string for empty input. Keep its behavior on non-empty input. Do not add any other files. Tests live in test_text_utils.py. Run them with python -m pytest. Verify with python3. The python command does not exist on this system.",
+      "prompt": "Update text_utils.js. The function firstWord crashes on an empty string. Make it return an empty string for empty input. Keep its behavior on non-empty input. Do not add any other files. Tests live in text_utils.test.js. Run them with node --test.",
       "workspaceFixture": "fixtures/task4",
       "expectedChangedFiles": [
-        "text_utils.py"
+        "text_utils.js"
       ],
       "verificationCommands": [
         {
           "id": "first-word-works",
           "name": "first_word handles empty input",
           "command": [
-            "python3",
-            "-c",
-            "from text_utils import first_word; assert first_word('hi there') == 'hi' and first_word('') == ''"
+            "node",
+            "-e",
+            "const {firstWord} = require('./text_utils'); if (firstWord('hi there') !== 'hi' || firstWord('') !== '') process.exit(1)"
           ]
         }
       ]
