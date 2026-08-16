@@ -360,23 +360,30 @@ pub fn prompt_text(request: &ChatRequest) -> String {
 }
 
 // Create the embedder from model files on disk.
+// Look in VERITAS_MODEL_DIR first, then the installed config dir, then ./models.
 // Exit with a clear error if the files are missing.
 pub fn build_embedder() -> Result<Embedder, Box<dyn std::error::Error + Send + Sync>> {
-    let model_path = "models/model.onnx";
-    let tokenizer_path = "models/tokenizer.json";
-
-    if !std::path::Path::new(model_path).exists() || !std::path::Path::new(tokenizer_path).exists()
-    {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        std::env::var("VERITAS_MODEL_DIR").unwrap_or_default(),
+        format!("{}/.config/veritas-cache/models", home),
+        "models".to_string(),
+    ];
+    let dir = candidates
+        .iter()
+        .find(|d| !d.is_empty() && std::path::Path::new(d).join("model.onnx").exists());
+    let Some(dir) = dir else {
         eprintln!(
-            "Model files are missing. Run ./scripts/fetch_model.sh to download them. \
-             Expected files: {} and {}",
-            model_path, tokenizer_path
+            "Model files are missing. Run ./scripts/fetch_model.sh to download them, \
+             or copy them to ~/.config/veritas-cache/models/."
         );
         std::process::exit(1);
-    }
+    };
+    let model_path = format!("{}/model.onnx", dir);
+    let tokenizer_path = format!("{}/tokenizer.json", dir);
 
-    let tokenizer = Tokenizer::from_file(tokenizer_path)?;
-    let session = Session::builder()?.commit_from_file(model_path)?;
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
+    let session = Session::builder()?.commit_from_file(&model_path)?;
 
     Ok(Embedder { tokenizer, session })
 }
