@@ -98,6 +98,26 @@ else
     fail "different request was not a miss"
 fi
 
+# Request four: body one with the bypass header. Expect BYPASS, not the stored entry.
+curl -sS -D "$HEADERS_FILE" -o /dev/null -X POST \
+    -H "Content-Type: application/json" -H "x-veritas-bypass: true" \
+    --data-binary "@$BODY_ONE" "$PROXY_URL/v1/chat/completions"
+if grep -q "^x-cache: BYPASS" "$HEADERS_FILE"; then
+    echo "PASS bypass header skips the cache"
+else
+    fail "bypass header did not skip the cache"
+fi
+
+# Request five: body one again. Expect an exact hit from request one.
+# A bypass write would have replaced nothing. The original entry must serve.
+curl -sS -D "$HEADERS_FILE" -o /dev/null -X POST \
+    -H "Content-Type: application/json" --data-binary "@$BODY_ONE" "$PROXY_URL/v1/chat/completions"
+if grep -q "^x-cache: HIT" "$HEADERS_FILE" && grep -q "^x-cache-match: exact" "$HEADERS_FILE"; then
+    echo "PASS bypass did not write over the stored entry"
+else
+    fail "bypass disturbed the stored entry"
+fi
+
 # Request four: a streaming body. Expect a miss and an SSE body.
 BODY_STREAM="$WORK_DIR/body_stream.json"
 curl -sS -D "$HEADERS_FILE" -o "$WORK_DIR/stream_body.txt" -X POST \
@@ -252,7 +272,8 @@ if grep -q '"hits_exact":1' "$WORK_DIR/metrics.json" \
     && grep -q '"misses":0' "$WORK_DIR/metrics.json" \
     && grep -q '"hits_semantic":0' "$WORK_DIR/metrics.json" \
     && grep -q '"stores":0' "$WORK_DIR/metrics.json" \
-    && grep -q '"evicted":0' "$WORK_DIR/metrics.json"; then
+    && grep -q '"evicted":0' "$WORK_DIR/metrics.json" \
+    && grep -q '"bypasses":' "$WORK_DIR/metrics.json"; then
     echo "PASS metrics endpoint reports the counters of this process"
 else
     fail "metrics endpoint did not report the expected counters"

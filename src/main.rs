@@ -40,6 +40,7 @@ async fn get_metrics(State(state): State<AppState>) -> Response {
         "misses": m.misses.load(Ordering::Relaxed),
         "stores": m.stores.load(Ordering::Relaxed),
         "evicted": m.evicted.load(Ordering::Relaxed),
+        "bypasses": m.bypasses.load(Ordering::Relaxed),
     }))
     .into_response()
 }
@@ -70,6 +71,7 @@ struct Metrics {
     misses: AtomicU64,
     stores: AtomicU64,
     evicted: AtomicU64,
+    bypasses: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -140,6 +142,18 @@ async fn chat_completions(
                 .into_response();
         }
     };
+
+    // A bypass request skips the cache. No read and no write, so eval
+    // traffic never serves stale entries and never pollutes the store.
+    let bypass = headers
+        .get("x-veritas-bypass")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if bypass {
+        state.metrics.bypasses.fetch_add(1, Ordering::Relaxed);
+        return forward_uncached(state, headers, body_bytes).await;
+    }
 
     let key = match cache_key(&request) {
         Ok(k) => k,
@@ -449,7 +463,59 @@ async fn serve_hit(
     }
 }
 
-// Cache a successful upstream response and update the adaptive policy.
+// Forward a request without touching the cache. Mark the response so the
+// client can verify the bypass on the wire.
+async fn forward_uncached(state: AppState, headers: HeaderMap, body_bytes: Bytes) -> Response {
+    let url = format!("{}/v1/chat/completions", state.upstream_base);
+    let mut upstream_request = state
+        .client
+        .post(&url)
+        .header(CONTENT_TYPE, "application/json")
+        .body(body_bytes);
+    if let Some(auth) = headers.get(AUTHORIZATION) {
+        if let Ok(value) = auth.to_str() {
+            upstream_request = upstream_request.header(AUTHORIZATION, value);
+        }
+    }
+    let upstream_response = match upstream_request.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Upstream request failed: {}", e);
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let status = upstream_response.status();
+    let streaming = upstream_response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.contains("text/event-stream"))
+        .unwrap_or(false);
+    if streaming {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("x-cache", "BYPASS")
+            .header("x-cache-policy", &state.policy_name)
+            .body(Body::from_stream(upstream_response.bytes_stream()))
+            .unwrap();
+    }
+    let response_text = match upstream_response.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Failed to read upstream response: {}", e);
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header("x-cache", "BYPASS")
+        .header("x-cache-policy", &state.policy_name)
+        .body(response_text.into())
+        .unwrap()
+}
+
 // Cache a successful upstream response and update the adaptive policy.
 // Attach the fresh response to the shadow row when shadow mode logged one.
 async fn maybe_store(
