@@ -1,51 +1,63 @@
 # veritas-cache
 
-veritas-cache is an OpenAI-compatible cache proxy. It receives requests from an OpenAI SDK client. It returns a stored response on a cache hit. It forwards the request on a cache miss.
+An OpenAI-compatible cache proxy for LLM calls. A repeated request gets a stored answer
+instead of a paid API call.
 
-The proxy supports exact-match and semantic caching. Semantic hits use one static global
-threshold or the adaptive ld3 policy. Streaming and non-streaming requests share one cache
-entry.
+## The goal
 
-## Requirements
+Semantic caches save real money. Production hit rates run 20 to 45 percent, and a hit
+saves the full cost of the call. The risk is the false hit: a cached answer that does not
+match the new question. Every shipped cache today controls that risk with one static
+global similarity threshold. One threshold cannot be right for every entry, so operators
+set it high and lose savings.
 
-- Rust 1.96 or newer
-- An API key for an upstream LLM provider, such as OpenAI
-- Downloaded local model files for embeddings
+veritas-cache learns a threshold per cached entry from observed outcomes. Each entry
+serves only when its own measured error rate stays under a budget you set. The goal is to
+cache more aggressively than a static threshold can safely allow, and to prove the bound
+with a benchmark you can rerun yourself.
 
-## Download the embedding model
+## Current state
 
-Run the fetch script once before the first build. The script downloads the model files into `models/`.
+Works today:
 
-```bash
-./scripts/fetch_model.sh
-```
+- Exact-match and semantic caching for chat completions, streaming and non-streaming.
+- The adaptive per-entry policy (`ld3`), live in the proxy with persisted state.
+- Shadow mode. Observe your own traffic and count would-be hits before you serve them.
+- A bypass header for eval runs, TTL and LRU eviction, exact-only mode per model,
+  metrics, and a JSON config file.
+- A macOS installer that registers a launchd service, and a Dockerfile.
 
-Do not commit the files in `models/`.
+Measured so far:
 
-## Run the proxy
+- 200,000 replayed queries from a 20,000-prompt Quora trace. The adaptive policy holds
+  its error budget at every operating point. The measured false-hit rate stays 10 to 20
+  times below the budget. Details in `bench/REPORT.md`.
+- An agent-harness experiment suite against a real coding agent. Serving cut upstream
+  prompt tokens by 51 to 75 percent across runs. In the final configuration every
+  passable task passed. Details in `bench/splice/RESULTS.md`.
 
-Set the upstream base URL and API key. Set `SEMANTIC_THRESHOLD` if you want a threshold other than the default `0.85`. Then start the server.
+Not done yet:
 
-```bash
-export UPSTREAM_BASE_URL=https://api.openai.com
-export OPENAI_API_KEY=your_key_here
-cargo run
-```
+- The benchmark trace is single-turn question pairs. Agent-traffic numbers come from
+  smaller experiment suites, not the 200,000-query harness.
+- No tenant isolation, no per-entry invalidation API, no cost view in `/metrics`.
+- Pre-1.0. The configuration surface may still change.
 
-The proxy listens on `127.0.0.1:8080`.
+## Quickstart
 
-## Install as a service (macOS)
+Three ways to run it. All need an API key for an upstream LLM provider.
 
-Run the installer once. It copies the binary to `~/.local/bin`, copies the model files to
-`~/.config/veritas-cache/models/`, and registers a launchd agent that starts at login.
+### Install as a service (macOS)
 
 ```bash
 ./scripts/install.sh
 ```
 
-The service listens on `127.0.0.1:18091` by default. Set `VERITAS_PORT` to change it.
+The installer builds the binary, installs it to `~/.local/bin`, installs the model files,
+and registers a launchd agent that starts at login. The service listens on
+`127.0.0.1:18091`. Set `VERITAS_PORT` to change the port.
 
-## Run with Docker
+### Run with Docker
 
 ```bash
 docker build -t veritas-cache .
@@ -56,11 +68,23 @@ The image downloads the model files at build time. The volume keeps the cache da
 The default upstream is the OpenAI API. Point it at another compatible provider with
 `-e UPSTREAM_BASE_URL=https://openrouter.ai/api`.
 
-## Point an OpenAI SDK client at the proxy
+### Run from source
 
-Change the `base_url` in the client configuration. Use the same API key.
+You need Rust 1.96 or newer.
 
-Python example:
+```bash
+./scripts/fetch_model.sh
+export UPSTREAM_BASE_URL=https://api.openai.com
+export OPENAI_API_KEY=your_key_here
+cargo run --release
+```
+
+The proxy listens on `127.0.0.1:8080`. Do not commit the files in `models/`.
+
+## Point your client at the proxy
+
+Change the `base_url` in the client configuration. Use the same API key. Nothing else
+changes in your code.
 
 ```python
 client = OpenAI(
@@ -69,15 +93,36 @@ client = OpenAI(
 )
 ```
 
+The proxy works with any OpenAI-compatible client. Point several tools at one local
+instance and the hit rate compounds across tools.
+
+## See what the cache did
+
+Every response carries headers.
+
+- `x-cache: HIT` means the response came from the cache. `x-cache: MISS` means the proxy
+  called the upstream API and stored the response. `x-cache: BYPASS` marks a request that
+  skipped the cache.
+- `x-cache-match: exact` or `x-cache-match: semantic` names the hit type.
+- `x-cache-sim: 0.876543` shows the cosine similarity of a semantic hit.
+
+Send `X-Veritas-Bypass: true` on a request to skip the cache. A bypass request never
+serves a stored entry and never writes one. Use it for eval runs and diagnostics.
+
+`GET /metrics` returns counters as JSON: `hits_exact`, `hits_semantic`, `misses`,
+`stores`, `evicted`, `bypasses`. The counters reset on restart.
+
 ## Configuration
 
 All settings have defaults. Environment variables win over config file values.
 
+- `HOST` sets the bind address. The default is `127.0.0.1`. Containers set `0.0.0.0`.
 - `PORT` sets the listen port. The default is `8080`.
 - `CACHE_DB_PATH` sets the SQLite path. The default is `cache.db`.
 - `UPSTREAM_BASE_URL` sets the upstream API. The default is `https://api.openai.com`.
 - `SEMANTIC_THRESHOLD` sets the minimum cosine similarity for a semantic hit. The default is `0.85`.
-- `SEMANTIC_POLICY=ld3` selects the adaptive per-entry policy. `ADAPTIVE_DELTA` sets its error budget. The default policy is `static`.
+- `SEMANTIC_POLICY` selects the policy. Values are `static`, `ld3`, and `ld3s`. The default is `static`.
+- `ADAPTIVE_DELTA` sets the error budget for the adaptive policies.
 - `CACHE_TTL_SECONDS` expires entries older than the limit. The default `0` disables expiry.
 - `CACHE_MAX_ENTRIES` evicts the least recently used entries beyond the cap. The default `0` disables the cap.
 - `CACHE_EXACT_ONLY_MODELS` lists model names that use exact matching only. Use a comma between names.
@@ -87,37 +132,43 @@ All settings have defaults. Environment variables win over config file values.
 ## Cache behavior
 
 - The proxy checks exact request matches first.
-- If the exact match misses, the proxy embeds the prompt and checks approximate nearest neighbors with a cosine similarity threshold.
-- `x-cache: HIT` means the response came from the cache. `x-cache: MISS` means the proxy called the upstream API and stored the response.
-- `x-cache-match: exact` marks an exact hit. `x-cache-match: semantic` marks a semantic hit.
-- `x-cache-sim: 0.876543` shows the cosine similarity of a semantic hit.
-- The cache key covers the full request, including `tool_choice`. It ignores `stream` and `stream_options`.
-- Streaming requests pass chunks through live. The proxy caches the assembled completion when the stream ends. Streaming hits are served as SSE.
+- If the exact match misses, the proxy embeds the prompt and checks approximate nearest
+  neighbors against the policy threshold.
+- The cache key covers the full request, including `tool_choice` and `prompt_cache_key`.
+  It ignores `stream` and `stream_options`.
+- Streaming requests pass chunks through live. The proxy caches the assembled completion
+  when the stream ends. Streaming hits are served as SSE.
 - Cache hits carry synthesized usage. The prompt token count matches the new request.
 - Exact-only models skip the semantic path. They still store responses for exact reuse.
 
+## Shadow mode
+
+Set `CACHE_SHADOW=1` to log every decision without serving from cache. The `shadow_log`
+table records each decision, its similarity, the cached response, and the fresh upstream
+response. Run shadow mode on your own traffic first. Judge the would-be hits offline.
+Then switch serving on with evidence.
+
 ## Benchmark
 
-The repository contains a benchmark trace, a replay harness, and four cache
-decision policies. The full scientific report is in `bench/REPORT.md`.
+The repository contains a benchmark trace, a replay harness, and four cache decision
+policies. The full scientific report is in `bench/REPORT.md`.
 
-Method summary: 20,000 prompts in 8,101 equivalence classes from Quora Question
-Pairs, replayed 10 times for 200,000 queries. Hit latency is measured. Miss
-latency uses a disclosed lognormal model.
+Method summary: 20,000 prompts in 8,101 equivalence classes from Quora Question Pairs,
+replayed 10 times for 200,000 queries. Hit latency is measured. Miss latency uses a
+disclosed lognormal model.
 
 Findings at a glance:
 
-- A random wrong entry embeds at 0.05 mean cosine similarity. The nearest wrong
-  entry embeds at 0.64. The nearest neighbor is the error source.
-- The per-entry adaptive policy holds its error budget at every operating
-  point. The measured false-hit rate stays 10 to 20 times below the budget.
-- At matched error, the per-entry policy beats the global adaptive policy by
-  about 20 points of hit rate. This reproduces the central claim of the vCache
-  paper (arXiv 2502.03771).
-- A tuned static threshold reaches a higher raw hit rate on this trace. It
-  gives no error guarantee and needs labeled data to tune.
-- The lookup p50 is about 18.6 ms. A hit is about 43 times faster than a
-  modeled miss at the median.
+- A random wrong entry embeds at 0.05 mean cosine similarity. The nearest wrong entry
+  embeds at 0.64. The nearest neighbor is the error source.
+- The per-entry adaptive policy holds its error budget at every operating point.
+- At matched error, the per-entry policy beats the global adaptive policy by about 20
+  points of hit rate. This reproduces the central claim of the vCache paper
+  (arXiv 2502.03771). The implementation is original work, written from the paper.
+- A tuned static threshold reaches a higher raw hit rate on this trace. It gives no error
+  guarantee and needs labeled data to tune.
+- The lookup p50 is about 18.6 ms. A hit is about 43 times faster than a modeled miss at
+  the median.
 
 Run the measurements and build the charts.
 
@@ -129,21 +180,6 @@ cargo run --release --bin bench
 python3 scripts/make_charts.py
 ```
 
-## Metrics
+## License
 
-`GET /metrics` returns request counters as JSON. The counters are `hits_exact`, `hits_semantic`, `misses`, `stores`, and `evicted`. The counters reset on restart.
-
-## Shadow mode
-
-Set `CACHE_SHADOW=1` to log every decision without serving from cache. The `shadow_log` table records each decision, its similarity, the cached response, and the fresh upstream response. Use the log to judge decisions offline against real traffic.
-
-## Status
-
-Phase 1: exact-match and semantic cache proxy with one static threshold. Done.
-Phase 2: benchmark trace, replay harness, and baseline measurements. Done.
-Phase 3: per-entry adaptive thresholds with a measured error bound. Done. The ld3 policy is
-wired into the proxy.
-Phase 5: productionization. Done. SSE streaming, persisted adaptive state, TTL and LRU
-eviction, exact-only mode, metrics, and a JSON config file.
-Phase 6: real-traffic evals. In progress. Shadow mode is done. The Splice control-loop
-experiment harness is built.
+MIT. See `LICENSE`.
