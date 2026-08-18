@@ -837,8 +837,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .ok()
         .or(file_config.port)
         .unwrap_or_else(|| "8080".to_string());
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
-    info!("veritas-cache listening on 127.0.0.1:{}", port);
+    // HOST defaults to loopback. Containers must set HOST=0.0.0.0.
+    let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port)).await?;
+    info!("veritas-cache listening on {}:{}", host, port);
     axum::serve(listener, app).await?;
 
     Ok(())

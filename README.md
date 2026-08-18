@@ -34,6 +34,28 @@ cargo run
 
 The proxy listens on `127.0.0.1:8080`.
 
+## Install as a service (macOS)
+
+Run the installer once. It copies the binary to `~/.local/bin`, copies the model files to
+`~/.config/veritas-cache/models/`, and registers a launchd agent that starts at login.
+
+```bash
+./scripts/install.sh
+```
+
+The service listens on `127.0.0.1:18091` by default. Set `VERITAS_PORT` to change it.
+
+## Run with Docker
+
+```bash
+docker build -t veritas-cache .
+docker run -p 8080:8080 -v veritas-data:/data veritas-cache
+```
+
+The image downloads the model files at build time. The volume keeps the cache database.
+The default upstream is the OpenAI API. Point it at another compatible provider with
+`-e UPSTREAM_BASE_URL=https://openrouter.ai/api`.
+
 ## Point an OpenAI SDK client at the proxy
 
 Change the `base_url` in the client configuration. Use the same API key.
