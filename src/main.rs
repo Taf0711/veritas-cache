@@ -26,7 +26,7 @@ use veritas_cache::{
     judge_content_equal, load_file_config, load_observations, lookup,
     insert_shadow_row, set_shadow_fresh,
     lookup_by_rowid, model_by_rowid, parse_exact_only_models, prompt_cache_key_by_rowid,
-    prompt_text, render_sse,
+    prompt_text, read_savings, record_saving, render_sse,
     response_content, semantic_hit, store, synthesize_usage, unix_now, ChatRequest, Embedder,
     ErrorResponse,
 };
@@ -34,6 +34,10 @@ use veritas_cache::{
 // Report the runtime counters as JSON.
 async fn get_metrics(State(state): State<AppState>) -> Response {
     let m = &state.metrics;
+    let savings = {
+        let conn = state.db.lock().await;
+        read_savings(&conn).unwrap_or_default()
+    };
     Json(json!({
         "hits_exact": m.hits_exact.load(Ordering::Relaxed),
         "hits_semantic": m.hits_semantic.load(Ordering::Relaxed),
@@ -41,6 +45,7 @@ async fn get_metrics(State(state): State<AppState>) -> Response {
         "stores": m.stores.load(Ordering::Relaxed),
         "evicted": m.evicted.load(Ordering::Relaxed),
         "bypasses": m.bypasses.load(Ordering::Relaxed),
+        "tokens_avoided": savings,
     }))
     .into_response()
 }
@@ -425,16 +430,35 @@ async fn serve_hit(
     match_kind: &str,
     similarity: Option<f32>,
 ) -> Response {
-    let response_json = {
+    let prompt_tokens = {
         let prompt = prompt_text(request);
         let embedder = state.embedder.lock().await;
         match count_tokens(&embedder, &prompt) {
-            Ok(prompt_tokens) => synthesize_usage(&response_json, prompt_tokens),
+            Ok(n) => Some(n),
             Err(e) => {
                 error!("Failed to count prompt tokens: {}", e);
-                response_json
+                None
             }
         }
+    };
+    // Count the avoided tokens before the usage rewrite consumes the response.
+    let completion_tokens = serde_json::from_str::<Value>(&response_json)
+        .ok()
+        .and_then(|v| {
+            v.get("usage")?
+                .get("completion_tokens")?
+                .as_u64()
+                .map(|n| n as usize)
+        });
+    if let (Some(p), Some(c)) = (prompt_tokens, completion_tokens) {
+        let conn = state.db.lock().await;
+        if let Err(e) = record_saving(&conn, &request.model, p, c) {
+            error!("Failed to record saving: {}", e);
+        }
+    }
+    let response_json = match prompt_tokens {
+        Some(n) => synthesize_usage(&response_json, n),
+        None => response_json,
     };
     let mut builder = Response::builder()
         .status(StatusCode::OK)

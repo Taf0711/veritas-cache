@@ -636,7 +636,51 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
         [],
     )?;
     migrate_shadow_log(conn)?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS savings (
+            model TEXT PRIMARY KEY,
+            prompt_tokens INTEGER NOT NULL DEFAULT 0,
+            completion_tokens INTEGER NOT NULL DEFAULT 0
+        )",
+        [],
+    )?;
     Ok(())
+}
+
+// A cache hit avoids a paid call. Count the prompt and completion tokens that
+// the call would have used. The counters persist across restarts.
+pub fn record_saving(
+    conn: &Connection,
+    model: &str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO savings (model, prompt_tokens, completion_tokens)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT (model) DO UPDATE SET
+             prompt_tokens = prompt_tokens + ?2,
+             completion_tokens = completion_tokens + ?3",
+        params![model, prompt_tokens as i64, completion_tokens as i64],
+    )?;
+    Ok(())
+}
+
+// Read the accumulated savings per model.
+pub fn read_savings(conn: &Connection) -> rusqlite::Result<Vec<(String, i64, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT model, prompt_tokens, completion_tokens FROM savings ORDER BY model",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 // Look up a cached response by key.
@@ -976,6 +1020,20 @@ mod tests {
         let forced_key = cache_key(&forced).unwrap();
         assert_ne!(forced_key, cache_key(&auto).unwrap());
         assert_ne!(forced_key, cache_key(&plain).unwrap());
+    }
+
+    #[test]
+    fn savings_accumulate_per_model() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        record_saving(&conn, "m/a", 100, 20).unwrap();
+        record_saving(&conn, "m/a", 50, 5).unwrap();
+        record_saving(&conn, "m/b", 7, 1).unwrap();
+        let rows = read_savings(&conn).unwrap();
+        assert_eq!(rows, vec![
+            ("m/a".to_string(), 150, 25),
+            ("m/b".to_string(), 7, 1),
+        ]);
     }
 
     #[test]

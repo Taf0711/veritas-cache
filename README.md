@@ -110,7 +110,10 @@ Send `X-Veritas-Bypass: true` on a request to skip the cache. A bypass request n
 serves a stored entry and never writes one. Use it for eval runs and diagnostics.
 
 `GET /metrics` returns counters as JSON: `hits_exact`, `hits_semantic`, `misses`,
-`stores`, `evicted`, `bypasses`. The counters reset on restart.
+`stores`, `evicted`, `bypasses`. The counters reset on restart. The `tokens_avoided`
+list persists in the database. It counts the prompt and completion tokens that cache
+hits avoided, per model. `scripts/veritas-status.sh` prints these numbers with an
+estimated dollar value.
 
 ## Configuration
 
