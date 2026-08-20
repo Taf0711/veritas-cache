@@ -1,4 +1,4 @@
-# veritas-cache
+# veritas
 
 An OpenAI-compatible cache proxy for LLM calls. A repeated request gets a stored answer
 instead of a paid API call.
@@ -11,7 +11,7 @@ match the new question. Every shipped cache today controls that risk with one st
 global similarity threshold. One threshold cannot be right for every entry, so operators
 set it high and lose savings.
 
-veritas-cache learns a threshold per cached entry from observed outcomes. Each entry
+veritas learns a threshold per cached entry from observed outcomes. Each entry
 serves only when its own measured error rate stays under a budget you set. The goal is to
 cache more aggressively than a static threshold can safely allow, and to prove the bound
 with a benchmark you can rerun yourself.
@@ -60,8 +60,8 @@ and registers a launchd agent that starts at login. The service listens on
 ### Run with Docker
 
 ```bash
-docker build -t veritas-cache .
-docker run -p 8080:8080 -v veritas-data:/data veritas-cache
+docker build -t veritas .
+docker run -p 8080:8080 -v veritas-data:/data veritas
 ```
 
 The image downloads the model files at build time. The volume keeps the cache database.
